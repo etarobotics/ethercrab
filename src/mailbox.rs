@@ -4,11 +4,16 @@ use crate::coe::CoeService;
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
+/// Mailbox message priority (ETG.1000.4).
 pub enum Priority {
+    /// Lowest priority.
     #[default]
     Lowest = 0x00,
+    /// Low priority.
     Low = 0x01,
+    /// High priority.
     High = 0x02,
+    /// Highest priority.
     Highest = 0x03,
 }
 
@@ -16,6 +21,7 @@ pub enum Priority {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
+/// Mailbox protocol carried in the mailbox data (ETG.1000.4 mailbox type).
 pub enum MailboxType {
     /// error (ERR)
     Err = 0x00,

@@ -173,6 +173,7 @@ mod maindevice;
 mod maindevice_config;
 mod pdi;
 mod pdu_loop;
+pub mod raw_mailbox;
 mod register;
 mod subdevice;
 pub mod subdevice_group;
@@ -195,8 +196,10 @@ pub use ethercrab_wire::{
     EtherCrabWireWrite, EtherCrabWireWriteSized,
 };
 use ethernet::EthernetAddress;
+pub use mailbox::{MailboxType, Priority};
 pub use maindevice::MainDevice;
 pub use maindevice_config::{MainDeviceConfig, RetryBehaviour};
+pub use raw_mailbox::{MailboxHeader, MailboxMessage, MAILBOX_MAX_LEN};
 pub use pdu_loop::{PduLoop, PduRx, PduStorage, PduTx, ReceiveAction, SendableFrame};
 pub use register::{DcSupport, RegisterAddress};
 pub use subdevice::{DcSync, SubDevice, SubDeviceIdentity, SubDevicePdi, SubDeviceRef};

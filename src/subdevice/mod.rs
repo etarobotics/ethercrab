@@ -799,6 +799,170 @@ where
         }
     }
 
+    /// Resolve the SubDevice's read (SubDevice OUT) and write (SubDevice IN) mailbox windows.
+    ///
+    /// Unlike [`coe_mailboxes`](Self::coe_mailboxes) this does *not* pre-drain the read mailbox, so
+    /// a pending message is left intact for [`mailbox_read`](Self::mailbox_read).
+    fn mailbox_windows(&self) -> Result<(Mailbox, Mailbox), Error> {
+        let read = self
+            .state
+            .config
+            .mailbox
+            .read
+            .ok_or(Error::Mailbox(MailboxError::NoMailbox))?;
+        let write = self
+            .state
+            .config
+            .mailbox
+            .write
+            .ok_or(Error::Mailbox(MailboxError::NoMailbox))?;
+
+        Ok((read, write))
+    }
+
+    /// Send a raw framed message to the SubDevice mailbox with the ETG.1000.4 delivery guarantee.
+    ///
+    /// Returns `Ok(())` only once the frame is latched in the MailboxOut SM (confirmed `WKC == 1`),
+    /// so the SubDevice is guaranteed to receive `data`. It does *not* wait for the SubDevice to
+    /// process it — that is what a response ([`mailbox_read`](Self::mailbox_read)) is for.
+    ///
+    /// The message rides as [`MailboxType::VendorSpecific`](crate::MailboxType) — a raw pipe that
+    /// CoE/SDO tooling will not interpret. Retransmissions reuse the same mailbox counter, so a
+    /// SubDevice can discard a duplicate arising from a lost acknowledgement.
+    pub async fn mailbox_write(&self, data: &[u8]) -> Result<(), Error> {
+        let (_read, write_mailbox) = self.mailbox_windows()?;
+
+        // One counter for the whole call: if a write latches but its WKC reply is lost, the retry
+        // re-sends the *same* counter once the SM drains, and the SubDevice dedups on it.
+        let counter = self.mailbox_counter();
+
+        let window = usize::from(write_mailbox.len);
+        let mut buf = [0u8; crate::raw_mailbox::MAILBOX_MAX_LEN];
+        let out = buf
+            .get_mut(..window)
+            .ok_or(Error::Mailbox(MailboxError::TooLong {
+                address: 0,
+                sub_index: 0,
+            }))?;
+        let len = crate::raw_mailbox::build_frame(
+            counter,
+            MailboxType::VendorSpecific,
+            data,
+            out,
+        )?;
+
+        let write_sm_status = RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
+
+        async {
+            loop {
+                // Wait for the MailboxOut SM to drain (previous message consumed by the SubDevice).
+                let sm_status = self
+                    .read(write_sm_status)
+                    .receive::<crate::sync_manager_channel::Status>(self.maindevice)
+                    .await?;
+
+                if sm_status.mailbox_full {
+                    self.maindevice.timeouts.loop_tick().await;
+                    continue;
+                }
+
+                // FPWR spanning the whole window so the ESC flips the SM full on the last byte;
+                // WKC == 1 confirms the SubDevice mailbox accepted the frame.
+                match self
+                    .write(write_mailbox.address)
+                    .with_len(write_mailbox.len)
+                    .send_wkc(self.maindevice, &buf[..len])
+                    .await
+                {
+                    Ok(()) => break Ok(()),
+                    // SM was still full / datagram dropped: retry with the same counter.
+                    Err(Error::WorkingCounter { .. }) => {
+                        self.maindevice.timeouts.loop_tick().await;
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        }
+        .timeout(self.maindevice.timeouts.mailbox_echo)
+        .await
+    }
+
+    /// One poll of the read (SubDevice OUT) mailbox: `None` if empty, else the message.
+    ///
+    /// Once the SM reads full we are committed to the message: a single-buffer mailbox stays full
+    /// until a `WKC == 1` read of the last byte, so a dropped FPRD merely leaves it full and we
+    /// re-read (bounded by `mailbox_echo`). No SM repeat-toggle is needed for single-buffer.
+    async fn read_mailbox_once(
+        &self,
+        read_mailbox: &Mailbox,
+    ) -> Result<Option<crate::raw_mailbox::MailboxMessage>, Error> {
+        let read_sm_status = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
+
+        let sm_status = self
+            .read(read_sm_status)
+            .receive::<crate::sync_manager_channel::Status>(self.maindevice)
+            .await?;
+
+        if !sm_status.mailbox_full {
+            return Ok(None);
+        }
+
+        let window = async {
+            loop {
+                match self
+                    .read(read_mailbox.address)
+                    .receive_slice(self.maindevice, read_mailbox.len)
+                    .await
+                {
+                    Ok(window) => break Ok(window),
+                    Err(Error::WorkingCounter { .. }) => {
+                        self.maindevice.timeouts.loop_tick().await;
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        }
+        .timeout(self.maindevice.timeouts.mailbox_echo)
+        .await?;
+
+        crate::raw_mailbox::parse_frame(&window).map(Some)
+    }
+
+    /// Read a raw framed message from the SubDevice mailbox, blocking until one arrives or the
+    /// `mailbox_response` timeout elapses.
+    ///
+    /// EtherCAT SubDevices never push, so this polls the MailboxIn SM. A timeout means the
+    /// SubDevice produced nothing in time (e.g. it is still processing a request).
+    pub async fn mailbox_read(&self) -> Result<crate::raw_mailbox::MailboxMessage, Error> {
+        let (read_mailbox, _write) = self.mailbox_windows()?;
+
+        async {
+            loop {
+                if let Some(msg) = self.read_mailbox_once(&read_mailbox).await? {
+                    break Ok(msg);
+                }
+
+                self.maindevice.timeouts.loop_tick().await;
+            }
+        }
+        .timeout(self.maindevice.timeouts.mailbox_response)
+        .await
+    }
+
+    /// Non-blocking read: one SM-status round-trip. `Some` if a message was waiting, else `None`.
+    ///
+    /// The `try_` refers to the mailbox condition, not I/O — this still performs a bus round-trip
+    /// (and, if a message is present, reads it out).
+    pub async fn try_mailbox_read(
+        &self,
+    ) -> Result<Option<crate::raw_mailbox::MailboxMessage>, Error> {
+        let (read_mailbox, _write) = self.mailbox_windows()?;
+
+        self.read_mailbox_once(&read_mailbox).await
+    }
+
     /// Write a value to the given SDO index (address) and sub-index.
     ///
     /// Note that this method currently only supports expedited SDO downloads (4 bytes maximum).
