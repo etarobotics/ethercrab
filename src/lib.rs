@@ -212,10 +212,12 @@ const MAINDEVICE_ADDR: EthernetAddress = EthernetAddress([0x10, 0x10, 0x10, 0x10
 /// Starting address for discovered subdevices.
 const BASE_SUBDEVICE_ADDRESS: u16 = 0x1000;
 
+/// Default lock type used by [`SubDeviceGroup`] when no explicit lock is given.
 #[cfg(feature = "std")]
-type DefaultLock = spin::rwlock::RwLock<(), spin::Yield>;
+pub type DefaultLock = spin::rwlock::RwLock<(), spin::Yield>;
+/// Default lock type used by [`SubDeviceGroup`] when no explicit lock is given.
 #[cfg(not(feature = "std"))]
-type DefaultLock = spin::rwlock::RwLock<(), spin::Spin>;
+pub type DefaultLock = spin::rwlock::RwLock<(), spin::Spin>;
 
 #[allow(unused)]
 fn test_logger() {
