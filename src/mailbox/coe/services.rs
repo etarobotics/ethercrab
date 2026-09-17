@@ -115,6 +115,34 @@ impl SdoNormal {
             },
         }
     }
+
+    /// A non-expedited, non-segmented ("normal") download initiate. The 4-byte
+    /// complete size followed by the object data ride as a trailing payload
+    /// after this header; `payload_len` is that trailing length (size word +
+    /// data) so the mailbox length covers it. Valid only when the whole request
+    /// fits one mailbox — a larger object would need segmented download.
+    pub fn download(counter: u8, index: u16, access: SubIndex, payload_len: usize) -> SdoNormal {
+        SdoNormal {
+            header: MailboxHeader {
+                length: (CoeHeader::PACKED_LEN + SdoHeader::PACKED_LEN + payload_len) as u16,
+                priority: Priority::Lowest,
+                mailbox_type: MailboxType::Coe,
+                counter,
+            },
+            coe_header: CoeHeader {
+                service: CoeService::SdoRequest,
+            },
+            sdo_header: SdoHeader {
+                size_indicator: true,
+                expedited_transfer: false,
+                size: 0,
+                complete_access: access.complete_access(),
+                command: CoeCommand::Download,
+                index,
+                sub_index: access.sub_index(),
+            },
+        }
+    }
 }
 
 impl Display for SdoNormal {
@@ -489,6 +517,37 @@ mod tests {
                     sub_index: 1,
                 },
                 data: buf
+            }
+        )
+    }
+
+    #[test]
+    fn download_request_normal() {
+        // 6-byte object: 4-byte complete-size word + 6 data bytes = 10 trailing.
+        let request = SdoNormal::download(7, 0x2010, 1.into(), 4 + 6);
+
+        pretty_assertions::assert_eq!(
+            request,
+            SdoNormal {
+                header: MailboxHeader {
+                    // CoE header (2) + SDO header (4) + trailing payload (10).
+                    length: 16,
+                    priority: Priority::Lowest,
+                    mailbox_type: MailboxType::Coe,
+                    counter: 7,
+                },
+                coe_header: CoeHeader {
+                    service: CoeService::SdoRequest,
+                },
+                sdo_header: SdoHeader {
+                    size_indicator: true,
+                    expedited_transfer: false,
+                    size: 0,
+                    complete_access: false,
+                    command: CoeCommand::Download,
+                    index: 0x2010,
+                    sub_index: 1,
+                },
             }
         )
     }

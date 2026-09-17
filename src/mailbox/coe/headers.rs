@@ -42,10 +42,11 @@ pub struct CoeHeader {
 #[wire(bits = 3)]
 #[repr(u8)]
 pub enum CoeCommand {
+    DownloadSegment = 0x00,
     Download = 0x01,
     Upload = 0x02,
-    Abort = 0x04,
     UploadSegment = 0x03,
+    Abort = 0x04,
 }
 
 /// Defined in ETG1000.6 Section 5.6.2.1.1

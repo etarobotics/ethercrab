@@ -35,6 +35,35 @@ pub(crate) use headers::{CoeCommand, CoeHeader, CoeService, SdoExpeditedPayload,
 pub use abort_code::CoeAbortCode;
 pub use headers::SubIndex;
 
+/// Upper bound on a single normal (non-segmented) SDO download's staged payload
+/// (complete-size word + object data). The transfer is also bounded by the
+/// SubDevice's mailbox at run time; this only sizes the stack buffer. A larger
+/// object needs segmented download.
+const MAX_SDO_DOWNLOAD_DATA: usize = 1024;
+
+/// A CoE request header followed by a trailing byte payload, packed
+/// contiguously — the shape a normal (non-expedited) SDO download needs, where
+/// the complete-size word and object data follow the fixed [`SdoNormal`] header.
+/// An empty payload reduces this to the bare request (uploads).
+struct WriteWithPayload<'a, R> {
+    request: R,
+    payload: &'a [u8],
+}
+
+impl<R: EtherCrabWireWrite> EtherCrabWireWrite for WriteWithPayload<'_, R> {
+    fn pack_to_slice_unchecked<'buf>(&self, buf: &'buf mut [u8]) -> &'buf [u8] {
+        let head = self.request.packed_len();
+        self.request.pack_to_slice_unchecked(&mut buf[..head]);
+        let total = head + self.payload.len();
+        buf[head..total].copy_from_slice(self.payload);
+        &buf[..total]
+    }
+
+    fn packed_len(&self) -> usize {
+        self.request.packed_len() + self.payload.len()
+    }
+}
+
 pub struct Coe<'maindevice, S> {
     subdevice: &'maindevice SubDeviceRef<'maindevice, S>,
 }
@@ -232,7 +261,8 @@ where
     async fn mailbox_write_read<R>(
         &'maindevice self,
         request: R,
-        total_len: usize,
+        write_payload: &[u8],
+        read_len: usize,
     ) -> Result<(R, ReceivedPdu<'maindevice>), Error>
     where
         R: CoeServiceRequest + Debug,
@@ -246,8 +276,23 @@ where
             )
         })?;
 
-        let packed = request.pack();
-        let data = packed.as_ref();
+        let write = WriteWithPayload {
+            request: &request,
+            payload: write_payload,
+        };
+        let write_len = write.packed_len();
+
+        // The whole request (headers plus any download data) must fit one mailbox
+        // — a larger object would need segmented download, which isn't implemented.
+        if write_len > usize::from(write_mailbox.len) {
+            fmt::error!(
+                "SDO write of {} bytes exceeds the {} byte mailbox",
+                write_len,
+                write_mailbox.len
+            );
+
+            return Err(Error::Internal);
+        }
 
         // Write mailbox data, then write to the end of the mailbox to signal to the SubDevice that
         // the write is finished. This is a wire optimisation over padding the write with zeroes up
@@ -257,20 +302,18 @@ where
 
             let mut frame = md.pdu_loop.alloc_frame()?;
 
-            // Write mailbox header and payload
             let write_handle = frame.push_pdu(
                 Command::Write(Writes::Fpwr {
                     address: self.subdevice.configured_address(),
                     register: write_mailbox.address,
                 }),
-                data,
-                // None,
-                Some(total_len as u16),
+                write,
+                Some(write_len as u16),
             )?;
 
             // Write a single byte to end of mailbox to trigger completion event in SubDevice if the
             // payload length isn't long enough to fill the mailbox.
-            let end_handle = if data.len() < usize::from(write_mailbox.len) {
+            let end_handle = if write_len < usize::from(write_mailbox.len) {
                 Some(frame.push_pdu(
                     Command::Write(Writes::Fpwr {
                         address: self.subdevice.configured_address(),
@@ -306,7 +349,7 @@ where
         }
 
         let mut response = self
-            .wait_for_mailbox_response(&read_mailbox, total_len)
+            .wait_for_mailbox_response(&read_mailbox, read_len)
             .await?;
 
         /// A super generalised version of the various header shapes for responses, extracting only
@@ -487,7 +530,10 @@ where
 
     /// Write a value to the given SDO index (address) and sub-index.
     ///
-    /// Note that this method currently only supports expedited SDO downloads (4 bytes maximum).
+    /// Objects up to 4 bytes go as an expedited download; larger ones as a
+    /// normal (non-segmented) download, bounded by the SubDevice's mailbox size.
+    /// An object too large for one mailbox would need segmented download, which
+    /// is not yet implemented.
     pub async fn sdo_write<T>(
         &self,
         index: u16,
@@ -501,28 +547,41 @@ where
 
         let counter = self.subdevice.mailbox_counter();
 
-        if value.packed_len() > 4 {
-            fmt::error!("Only 4 byte SDO writes or smaller are supported currently.");
+        let data_len = value.packed_len();
 
-            // TODO: Normal SDO download. Only expedited requests for now
-            return Err(Error::Internal);
+        if data_len <= 4 {
+            let mut buf = [0u8; 4];
+            value.pack_to_slice(&mut buf)?;
+
+            let request = SdoExpedited::download(counter, index, sub_index, buf, data_len as u8);
+
+            fmt::trace!("CoE expedited download");
+
+            // The expedited struct carries its own data, so no trailing payload.
+            self.mailbox_write_read(request, &[], request.packed_len())
+                .await?;
+
+            return Ok(());
         }
 
-        let mut buf = [0u8; 4];
+        // Normal download: the complete-size word (u32) and the object data ride
+        // as a trailing payload after the header.
+        let mut payload = heapless::Vec::<u8, MAX_SDO_DOWNLOAD_DATA>::new();
+        payload
+            .extend_from_slice(&(data_len as u32).to_le_bytes())
+            .map_err(|()| Error::Internal)?;
+        payload
+            .resize(u32::PACKED_LEN + data_len, 0)
+            .map_err(|()| Error::Internal)?;
+        value.pack_to_slice(&mut payload[u32::PACKED_LEN..])?;
 
-        value.pack_to_slice(&mut buf)?;
+        let request = SdoNormal::download(counter, index, sub_index, payload.len());
 
-        let request =
-            SdoExpedited::download(counter, index, sub_index, buf, value.packed_len() as u8);
+        fmt::trace!("CoE normal download, {} bytes", data_len);
 
-        fmt::trace!("CoE download");
-
-        let (_response, _data) = self
-            // Expedited struct includes data in its length so we don't need to add anything here
-            .mailbox_write_read(request, request.packed_len())
+        // The initiate-download response is a bare SDO response header.
+        self.mailbox_write_read(request, &payload, SdoNormal::PACKED_LEN)
             .await?;
-
-        // TODO: Validate reply?
 
         Ok(())
     }
@@ -665,7 +724,7 @@ where
         fmt::trace!("CoE upload {:#06x} {:?}", index, sub_index);
 
         let (headers, response) = self
-            .mailbox_write_read(request, request.packed_len() + T::PACKED_LEN)
+            .mailbox_write_read(request, &[], request.packed_len() + T::PACKED_LEN)
             .await?;
         let data: &[u8] = &response;
 
@@ -697,7 +756,7 @@ where
         fmt::trace!("CoE upload {:#06x} {:?}", index, sub_index);
 
         let (headers, response) = self
-            .mailbox_write_read(request, request.packed_len() + T::PACKED_LEN)
+            .mailbox_write_read(request, &[], request.packed_len() + T::PACKED_LEN)
             .await?;
         let data: &[u8] = &response;
 
@@ -741,7 +800,7 @@ where
                     fmt::trace!("CoE upload segmented");
 
                     let (headers, data) = self
-                        .mailbox_write_read(request, request.packed_len() + chunk_len)
+                        .mailbox_write_read(request, &[], request.packed_len() + chunk_len)
                         .await?;
 
                     // The spec defines the data length as n-3, so we'll just go with that magic
