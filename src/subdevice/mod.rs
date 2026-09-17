@@ -538,6 +538,19 @@ where
         Coe::new(self).sdo_read(index, sub_index).await
     }
 
+    /// Read an SDO into a caller-provided byte buffer, returning the populated
+    /// prefix. The transfer width is the runtime `buf.len()` rather than a
+    /// compile-time type size, so this reads objects whose width isn't known
+    /// until runtime. `buf` must be at least as large as the object.
+    pub async fn sdo_read_slice<'buf>(
+        &self,
+        index: u16,
+        sub_index: impl Into<SubIndex>,
+        buf: &'buf mut [u8],
+    ) -> Result<&'buf [u8], Error> {
+        Coe::new(self).sdo_read_slice(index, sub_index, buf).await
+    }
+
     pub(crate) async fn sdo_read_expedited<T>(
         &self,
         index: u16,
@@ -551,7 +564,9 @@ where
 
     /// Write a value to the given SDO index (address) and sub-index.
     ///
-    /// Note that this method currently only supports expedited SDO downloads (4 bytes maximum).
+    /// Payloads of 4 bytes or fewer use an expedited download; larger payloads
+    /// use a normal (non-segmented) download and so are bounded by the write
+    /// mailbox size.
     pub async fn sdo_write<T>(
         &self,
         index: u16,

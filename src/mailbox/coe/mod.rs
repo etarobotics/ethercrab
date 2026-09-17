@@ -746,26 +746,62 @@ where
     where
         T: EtherCrabWireReadSized,
     {
-        let sub_index = sub_index.into();
-
         let mut storage = T::buffer();
-        let buf = storage.as_mut();
+
+        let response_payload = self
+            .sdo_read_slice(index, sub_index, storage.as_mut())
+            .await?;
+
+        T::unpack_from_slice(response_payload).map_err(|_| {
+            fmt::error!(
+                "SDO expedited data decode T: {} (len {}) data {:?} (len {})",
+                type_name::<T>(),
+                T::PACKED_LEN,
+                response_payload,
+                response_payload.len()
+            );
+
+            Error::Pdu(PduError::Decode)
+        })
+    }
+
+    /// Read an SDO into a caller-provided byte buffer, returning the populated
+    /// prefix. Unlike [`sdo_read`](Self::sdo_read), the transfer width is the
+    /// runtime `buf.len()` rather than a compile-time type size, so this reads
+    /// objects whose width isn't known until runtime. `buf` bounds the mailbox
+    /// read (it must be at least as large as the object, or the transfer aborts
+    /// with [`MailboxError::TooLong`]); sizing it to the exact object avoids
+    /// reading past the read mailbox on the wire.
+    pub async fn sdo_read_slice<'buf>(
+        &self,
+        index: u16,
+        sub_index: impl Into<SubIndex>,
+        buf: &'buf mut [u8],
+    ) -> Result<&'buf [u8], Error> {
+        let sub_index = sub_index.into();
 
         let request = SdoNormal::upload(self.subdevice.mailbox_counter(), index, sub_index);
 
         fmt::trace!("CoE upload {:#06x} {:?}", index, sub_index);
 
         let (headers, response) = self
-            .mailbox_write_read(request, &[], request.packed_len() + T::PACKED_LEN)
+            .mailbox_write_read(request, &[], request.packed_len() + buf.len())
             .await?;
         let data: &[u8] = &response;
 
         // Expedited transfers where the data is 4 bytes or less long, denoted in the SDO header
         // size value.
-        let response_payload = if headers.sdo_header.expedited_transfer {
+        let len = if headers.sdo_header.expedited_transfer {
             let data_len = 4usize.saturating_sub(usize::from(headers.sdo_header.size));
 
-            data.get(0..data_len).ok_or(Error::Internal)?
+            let src = data.get(0..data_len).ok_or(Error::Internal)?;
+            buf.get_mut(0..data_len)
+                .ok_or(Error::Mailbox(MailboxError::TooLong {
+                    address: headers.sdo_header.index,
+                    sub_index: headers.sdo_header.sub_index,
+                }))?
+                .copy_from_slice(src);
+            data_len
         }
         // Data is either a normal upload or a segmented upload
         else {
@@ -784,8 +820,13 @@ where
 
             // If it's a normal upload, the response payload is returned in the initial mailbox read
             if complete_size <= u32::from(data_length) {
-                data.get(0..usize::from(data_length))
+                let src = data
+                    .get(0..usize::from(data_length))
+                    .ok_or(Error::Internal)?;
+                buf.get_mut(0..usize::from(data_length))
                     .ok_or(Error::Internal)?
+                    .copy_from_slice(src);
+                usize::from(data_length)
             }
             // If it's a segmented upload, we must make subsequent requests to load all segment data
             // from the read mailbox.
@@ -829,21 +870,11 @@ where
                     toggle = !toggle;
                 }
 
-                buf.get(0..total_len).ok_or(Error::Internal)?
+                total_len
             }
         };
 
-        T::unpack_from_slice(response_payload).map_err(|_| {
-            fmt::error!(
-                "SDO expedited data decode T: {} (len {}) data {:?} (len {})",
-                type_name::<T>(),
-                T::PACKED_LEN,
-                response_payload,
-                response_payload.len()
-            );
-
-            Error::Pdu(PduError::Decode)
-        })
+        buf.get(0..len).ok_or(Error::Internal)
     }
 
     /// List out all of the CoE objects' addresses of kind `list_type`.
