@@ -636,14 +636,39 @@ where
 
         // Wait for SubDevice OUT mailbox to be ready
         async {
+            let mut no_response = 0u32;
+
             loop {
-                let sm_status = self
+                // WKC≠1 means the subdevice didn't answer this SM-status read (starved/absent), not
+                // that the mailbox is empty. Treat it as "retry", not a hard error, so a transient
+                // miss doesn't abort the whole SDO — but surface persistent silence rather than
+                // letting it look like a plain mailbox_echo timeout.
+                match self
                     .read(mailbox_read_sm)
                     .receive::<crate::sync_manager_channel::Status>(self.maindevice)
-                    .await?;
+                    .await
+                {
+                    Ok(sm_status) => {
+                        no_response = 0;
 
-                if sm_status.mailbox_full {
-                    break Ok(());
+                        if sm_status.mailbox_full {
+                            break Ok(());
+                        }
+                    }
+                    Err(Error::WorkingCounter { .. }) => {
+                        no_response += 1;
+
+                        if no_response % 500 == 0 {
+                            fmt::warn!(
+                                "SubDevice {:#06x}: {} consecutive mailbox SM-status reads returned \
+                                 WKC=0 — subdevice not responding (not present, or its ESC register \
+                                 bus is starved by PDI activity)",
+                                self.configured_address,
+                                no_response,
+                            );
+                        }
+                    }
+                    Err(e) => break Err(e),
                 }
 
                 self.maindevice.timeouts.loop_tick().await;
@@ -1338,15 +1363,44 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
 
     pub(crate) async fn wait_for_state(&self, desired_state: SubDeviceState) -> Result<(), Error> {
         async {
-            loop {
-                let status = self
-                    .read(RegisterAddress::AlStatus)
-                    .ignore_wkc()
-                    .receive::<AlControl>(self.maindevice)
-                    .await?;
+            let mut no_response = 0u32;
 
-                if status.state == desired_state {
-                    break Ok(());
+            loop {
+                // Do NOT ignore the working counter here. A subdevice that doesn't answer (absent,
+                // or its ESC register bus starved by PDI traffic) returns WKC=0, and the PDU's data
+                // buffer stays at the zero we sent. Ignoring WKC would decode that as AL state 0 —
+                // an invalid state that never matches `desired_state`, silently spinning until the
+                // state-transition timeout. That masks "subdevice not answering" as "state never
+                // reached". Instead, keep the default WKC=1 check and treat WKC≠1 as "no answer,
+                // retry" so we never act on unvalidated data, and surface persistent silence.
+                match self
+                    .read(RegisterAddress::AlStatus)
+                    .receive::<AlControl>(self.maindevice)
+                    .await
+                {
+                    Ok(status) => {
+                        no_response = 0;
+
+                        if status.state == desired_state {
+                            break Ok(());
+                        }
+                    }
+                    Err(Error::WorkingCounter { .. }) => {
+                        no_response += 1;
+
+                        // loop_tick is ~ms; ~500 misses ≈ ~1s of a subdevice not answering at all.
+                        if no_response % 500 == 0 {
+                            fmt::warn!(
+                                "SubDevice {:#06x}: {} consecutive AL Status reads returned WKC=0 \
+                                 while waiting for {} — subdevice not responding (not present, or \
+                                 its ESC register bus is starved by PDI activity)",
+                                self.configured_address,
+                                no_response,
+                                desired_state,
+                            );
+                        }
+                    }
+                    Err(e) => break Err(e),
                 }
 
                 self.maindevice.timeouts.loop_tick().await;
