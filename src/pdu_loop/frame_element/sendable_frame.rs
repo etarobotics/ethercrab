@@ -74,6 +74,9 @@ impl<'sto> SendableFrame<'sto> {
         self.inner.set_state(FrameState::Sent);
     }
 
+    // Only the io_uring (Linux) and Windows blocking send loops read the slot index off a sendable
+    // frame; the generic unix loop does not, so it would otherwise be dead code there.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub(crate) fn storage_slot_index(&self) -> u8 {
         self.inner.storage_slot_index()
     }

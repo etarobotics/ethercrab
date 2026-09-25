@@ -24,13 +24,16 @@ pub enum CoeService {
     SdoInformation = 0x08,
 }
 
-/// Defined in ETG1000.6 Section 5.6.2.1.1
+/// The 2-byte CoE header that follows the mailbox header (ETG.1000.6 Table 29 – CoE elements).
+///
+/// The raw mailbox transport owns the 6-byte ETG.1000.4 mailbox header; this is the CoE-specific
+/// header that begins the mailbox body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ethercrab_wire::EtherCrabWireReadWrite)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[wire(bytes = 2)]
 pub struct CoeHeader {
-    // _number: u9,
-    // _reserved3: u3,
-    /// Defined in ETG1000.6 5.6.1 Table 29 – CoE elements.
+    // The 9-bit Number and 3 reserved bits ahead of the service are unused by SDO up/download and
+    // sent as zero, so they are skipped rather than represented.
     #[wire(pre_skip = 12, bits = 4)]
     pub service: CoeService,
 }

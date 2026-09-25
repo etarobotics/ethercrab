@@ -12,9 +12,12 @@ use crate::{
     command::Command,
     dl_status::DlStatus,
     eeprom::{device_provider::DeviceEeprom, types::SiiOwner},
-    error::{Error, IgnoreNoCategory},
+    error::{Error, IgnoreNoCategory, MailboxError},
     fmt,
-    mailbox::coe::{self, Coe, SdoExpeditedPayload, SubIndex},
+    mailbox::{
+        MailboxType,
+        coe::{self, Coe, SdoExpeditedPayload, SubIndex},
+    },
     maindevice::MainDevice,
     register::{DcSupport, RegisterAddress, SupportFlags},
     subdevice::{ports::Ports, types::SubDeviceConfig},
@@ -28,7 +31,8 @@ use core::{
 };
 use embedded_io_async::{Read, Write as EioWrite};
 use ethercrab_wire::{
-    EtherCrabWireReadSized, EtherCrabWireReadWrite, EtherCrabWireWrite, EtherCrabWireWriteSized,
+    EtherCrabWireReadSized, EtherCrabWireReadWrite, EtherCrabWireSized, EtherCrabWireWrite,
+    EtherCrabWireWriteSized,
 };
 
 use self::eeprom::SubDeviceEeprom;
@@ -574,6 +578,274 @@ where
         Coe::new(self).sdo_read_expedited(index, sub_index).await
     }
 
+    /// Resolve the SubDevice's read (SubDevice OUT) and write (SubDevice IN) mailbox windows.
+    fn mailbox_windows(&self) -> Result<(Mailbox, Mailbox), Error> {
+        let read = self
+            .state
+            .config
+            .mailbox
+            .read
+            .ok_or(Error::Mailbox(MailboxError::NoMailbox))?;
+        let write = self
+            .state
+            .config
+            .mailbox
+            .write
+            .ok_or(Error::Mailbox(MailboxError::NoMailbox))?;
+
+        Ok((read, write))
+    }
+
+    /// Send a framed message of the given mailbox protocol to the SubDevice mailbox with the
+    /// ETG.1000.4 delivery guarantee.
+    ///
+    /// Returns `Ok(())` only once the frame is latched in the MailboxOut SM (confirmed `WKC == 1`),
+    /// so the SubDevice is guaranteed to receive `data`. It does *not* wait for the SubDevice to
+    /// process it — that is what a response ([`mailbox_read`](Self::mailbox_read)) is for.
+    ///
+    /// `mailbox_type` selects the protocol the body carries (e.g. [`MailboxType::Coe`] or
+    /// [`MailboxType::Foe`]); the caller owns everything after the 6-byte header. `body` is any
+    /// [`EtherCrabWireWrite`] — a raw `&[u8]` or a typed protocol frame — and is packed directly
+    /// into the send frame after the mailbox header, with no intermediate buffer. Retransmissions
+    /// reuse the same mailbox counter, so a SubDevice can discard a duplicate arising from a lost
+    /// acknowledgement.
+    pub async fn mailbox_write(
+        &self,
+        mailbox_type: MailboxType,
+        body: impl ethercrab_wire::EtherCrabWireWrite,
+    ) -> Result<(), Error> {
+        let (_read, write_mailbox) = self.mailbox_windows()?;
+
+        // One counter for the whole call: if a write latches but its WKC reply is lost, the retry
+        // re-sends the *same* counter once the SM drains, and the SubDevice dedups on it.
+        let counter = self.mailbox_counter();
+
+        let body_len = body.packed_len();
+
+        let window = usize::from(write_mailbox.len);
+        // Checked before packing: `pack_to_slice_unchecked` in the send path panics on a short
+        // buffer, so an oversized body must be rejected here rather than reaching it.
+        if crate::raw_mailbox::MailboxHeader::PACKED_LEN + body_len > window {
+            return Err(Error::Mailbox(MailboxError::TooLong {
+                address: 0,
+                sub_index: 0,
+            }));
+        }
+
+        // Packed straight into the send frame by the PDU layer — no scratch buffer.
+        let frame = crate::raw_mailbox::MailboxFrame {
+            header: crate::raw_mailbox::MailboxHeader {
+                length: body_len as u16,
+                priority: crate::mailbox::Priority::Lowest,
+                mailbox_type,
+                counter,
+            },
+            body,
+        };
+
+        let write_sm_status = RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
+
+        async {
+            loop {
+                // Wait for the MailboxOut SM to drain (previous message consumed by the SubDevice).
+                let sm_status = self
+                    .read(write_sm_status)
+                    .receive::<crate::sync_manager_channel::Status>(self.maindevice)
+                    .await?;
+
+                if sm_status.mailbox_full {
+                    self.maindevice.timeouts.loop_tick().await;
+                    continue;
+                }
+
+                // FPWR spanning the whole window so the ESC flips the SM full on the last byte;
+                // WKC == 1 confirms the SubDevice mailbox accepted the frame.
+                match self
+                    .write(write_mailbox.address)
+                    .with_len(write_mailbox.len)
+                    // Borrowed, not moved: the loop may retry this send on a dropped datagram.
+                    .send_wkc(self.maindevice, &frame)
+                    .await
+                {
+                    Ok(()) => break Ok(()),
+                    // SM was still full / datagram dropped: retry with the same counter.
+                    Err(Error::WorkingCounter { .. }) => {
+                        self.maindevice.timeouts.loop_tick().await;
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        }
+        .timeout(self.maindevice.timeouts.mailbox_echo())
+        .await
+    }
+
+    /// One poll of the read (SubDevice OUT) mailbox: `None` if empty, else the message.
+    ///
+    /// Once the SM reads full we are committed to the message: a single-buffer mailbox stays full
+    /// until a `WKC == 1` read of the last byte, so a dropped FPRD merely leaves it full and we
+    /// re-read (bounded by `mailbox_echo`). No SM repeat-toggle is needed for single-buffer.
+    async fn read_mailbox_once(
+        &self,
+        read_mailbox: &Mailbox,
+    ) -> Result<Option<crate::raw_mailbox::MailboxMessage<'maindevice>>, Error> {
+        let read_sm_status = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
+
+        let sm_status = self
+            .read(read_sm_status)
+            .receive::<crate::sync_manager_channel::Status>(self.maindevice)
+            .await?;
+
+        if !sm_status.mailbox_full {
+            return Ok(None);
+        }
+
+        let window = async {
+            loop {
+                match self
+                    .read(read_mailbox.address)
+                    .receive_slice(self.maindevice, read_mailbox.len)
+                    .await
+                {
+                    Ok(window) => break Ok(window),
+                    Err(Error::WorkingCounter { .. }) => {
+                        self.maindevice.timeouts.loop_tick().await;
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        }
+        .timeout(self.maindevice.timeouts.mailbox_echo())
+        .await?;
+
+        crate::raw_mailbox::MailboxMessage::parse(window).map(Some)
+    }
+
+    /// Read a raw framed message from the SubDevice mailbox, blocking until one arrives or the
+    /// `mailbox_response` timeout elapses.
+    ///
+    /// EtherCAT SubDevices never push, so this polls the MailboxIn SM. A timeout means the
+    /// SubDevice produced nothing in time (e.g. it is still processing a request).
+    pub async fn mailbox_read(
+        &self,
+    ) -> Result<crate::raw_mailbox::MailboxMessage<'maindevice>, Error> {
+        let (read_mailbox, _write) = self.mailbox_windows()?;
+
+        async {
+            loop {
+                if let Some(msg) = self.read_mailbox_once(&read_mailbox).await? {
+                    break Ok(msg);
+                }
+
+                self.maindevice.timeouts.loop_tick().await;
+            }
+        }
+        .timeout(self.maindevice.timeouts.mailbox_response())
+        .await
+    }
+
+    /// Non-blocking read: one SM-status round-trip. `Some` if a message was waiting, else `None`.
+    ///
+    /// The `try_` refers to the mailbox condition, not I/O — this still performs a bus round-trip
+    /// (and, if a message is present, reads it out).
+    pub async fn try_mailbox_read(
+        &self,
+    ) -> Result<Option<crate::raw_mailbox::MailboxMessage<'maindevice>>, Error> {
+        let (read_mailbox, _write) = self.mailbox_windows()?;
+
+        self.read_mailbox_once(&read_mailbox).await
+    }
+
+    /// Upload a file from the SubDevice over File over EtherCAT (FoE).
+    ///
+    /// Reads `filename` (with the given FoE `password`, `0` when none is required) into `dest`,
+    /// returning the number of bytes written. Fails with [`Error::Foe`] carrying
+    /// [`FoeError::DestTooSmall`](crate::error::FoeError::DestTooSmall) if the file is larger than
+    /// `dest`.
+    ///
+    /// A transfer holds the SubDevice's mailbox for its whole duration and should be run before
+    /// cyclic operation (PRE-OP/SAFE-OP), not while the process data is exchanged in OP.
+    pub async fn foe_read(
+        &self,
+        filename: &str,
+        password: u32,
+        dest: &mut [u8],
+    ) -> Result<usize, Error> {
+        use crate::foe::read::{FoeRead, Progress};
+
+        fn copy_into(dest: &mut [u8], written: usize, bytes: &[u8]) -> Result<usize, Error> {
+            let capacity = dest.len();
+            let end = written + bytes.len();
+            dest.get_mut(written..end)
+                .ok_or(Error::Foe(crate::error::FoeError::DestTooSmall { capacity }))?
+                .copy_from_slice(bytes);
+            Ok(end)
+        }
+
+        let mut transfer = FoeRead::new(filename, password, self.foe_mailbox_payload()?)
+            .map_err(Error::Foe)?;
+        let mut written = 0;
+
+        loop {
+            self.mailbox_write(MailboxType::Foe, transfer.frame()).await?;
+
+            let reply = self.mailbox_read().await?;
+
+            match transfer.advance(reply.body()).map_err(Error::Foe)? {
+                Progress::Busy => continue,
+                Progress::Chunk(bytes) => written = copy_into(dest, written, bytes)?,
+                Progress::Last(bytes) => {
+                    written = copy_into(dest, written, bytes)?;
+                    // Acknowledge the final packet so the SubDevice sees the transfer complete.
+                    self.mailbox_write(MailboxType::Foe, transfer.frame()).await?;
+                    return Ok(written);
+                }
+            }
+        }
+    }
+
+    /// Download a file to the SubDevice over File over EtherCAT (FoE), e.g. a firmware image or a
+    /// configuration file.
+    ///
+    /// Writes `data` to `filename` (with the given FoE `password`, `0` when none is required).
+    ///
+    /// A transfer holds the SubDevice's mailbox for its whole duration and should be run before
+    /// cyclic operation (PRE-OP/SAFE-OP, or the dedicated bootstrap state for a firmware update),
+    /// not while the process data is exchanged in OP.
+    pub async fn foe_write(
+        &self,
+        filename: &str,
+        password: u32,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        use crate::foe::write::{FoeWrite, Progress};
+
+        let mut transfer = FoeWrite::new(filename, password, data, self.foe_mailbox_payload()?)
+            .map_err(Error::Foe)?;
+
+        loop {
+            self.mailbox_write(MailboxType::Foe, transfer.frame()).await?;
+
+            let reply = self.mailbox_read().await?;
+
+            match transfer.advance(reply.body()).map_err(Error::Foe)? {
+                Progress::Busy | Progress::More => continue,
+                Progress::Done => return Ok(()),
+            }
+        }
+    }
+
+    /// The largest FoE payload the SubDevice's mailbox can carry: the smaller of the two mailbox SM
+    /// windows, less the 6-byte mailbox header. Both directions must hold a full FoE frame.
+    fn foe_mailbox_payload(&self) -> Result<usize, Error> {
+        let (read_mailbox, write_mailbox) = self.mailbox_windows()?;
+
+        Ok(usize::from(read_mailbox.len.min(write_mailbox.len))
+            .saturating_sub(crate::raw_mailbox::MailboxHeader::PACKED_LEN))
+    }
+
     /// Write a value to the given SDO index (address) and sub-index.
     ///
     /// Note that this method currently only supports expedited SDO downloads (4 bytes maximum).
@@ -752,7 +1024,7 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
         futures_lite::future::try_zip(self.state(), code).await
     }
 
-    fn eeprom(&self) -> SubDeviceEeprom<DeviceEeprom> {
+    fn eeprom(&self) -> SubDeviceEeprom<DeviceEeprom<'_>> {
         SubDeviceEeprom::new(DeviceEeprom::new(self.maindevice, self.configured_address))
     }
 
@@ -782,15 +1054,44 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
 
     pub(crate) async fn wait_for_state(&self, desired_state: SubDeviceState) -> Result<(), Error> {
         async {
-            loop {
-                let status = self
-                    .read(RegisterAddress::AlStatus)
-                    .ignore_wkc()
-                    .receive::<AlControl>(self.maindevice)
-                    .await?;
+            let mut no_response = 0u32;
 
-                if status.state == desired_state {
-                    break Ok(());
+            loop {
+                // Do NOT ignore the working counter here. A subdevice that doesn't answer (absent,
+                // or its ESC register bus starved by PDI traffic) returns WKC=0, and the PDU's data
+                // buffer stays at the zero we sent. Ignoring WKC would decode that as AL state 0 —
+                // an invalid state that never matches `desired_state`, silently spinning until the
+                // state-transition timeout. That masks "subdevice not answering" as "state never
+                // reached". Instead, keep the default WKC=1 check and treat WKC≠1 as "no answer,
+                // retry" so we never act on unvalidated data, and surface persistent silence.
+                match self
+                    .read(RegisterAddress::AlStatus)
+                    .receive::<AlControl>(self.maindevice)
+                    .await
+                {
+                    Ok(status) => {
+                        no_response = 0;
+
+                        if status.state == desired_state {
+                            break Ok(());
+                        }
+                    }
+                    Err(Error::WorkingCounter { .. }) => {
+                        no_response += 1;
+
+                        // loop_tick is ~ms; ~500 misses ≈ ~1s of a subdevice not answering at all.
+                        if no_response % 500 == 0 {
+                            fmt::warn!(
+                                "SubDevice {:#06x}: {} consecutive AL Status reads returned WKC=0 \
+                                 while waiting for {} — subdevice not responding (not present, or \
+                                 its ESC register bus is starved by PDI activity)",
+                                self.configured_address,
+                                no_response,
+                                desired_state,
+                            );
+                        }
+                    }
+                    Err(e) => break Err(e),
                 }
 
                 self.maindevice.timeouts.loop_tick().await;

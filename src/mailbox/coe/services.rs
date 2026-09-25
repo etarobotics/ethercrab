@@ -1,20 +1,15 @@
 use super::{CoeService, SdoInfoOpCode, SubIndex};
-use crate::mailbox::{
-    MailboxHeader, MailboxType, Priority,
-    coe::{
-        CoeCommand, CoeHeader,
-        headers::{SdoHeader, SdoHeaderSegmented, SdoInfoHeader},
-    },
+use crate::mailbox::coe::{
+    CoeCommand, CoeHeader,
+    headers::{SdoHeader, SdoHeaderSegmented, SdoInfoHeader},
 };
 use core::fmt::Display;
 
 /// An expedited (data contained within SDO as opposed to sent in subsequent packets) SDO download
 /// request.
 #[derive(Debug, Copy, Clone, PartialEq, ethercrab_wire::EtherCrabWireReadWrite)]
-#[wire(bytes = 16)]
+#[wire(bytes = 10)]
 pub struct SdoExpedited {
-    #[wire(bytes = 6)]
-    pub header: MailboxHeader,
     #[wire(bytes = 2)]
     pub coe_header: CoeHeader,
     #[wire(bytes = 4)]
@@ -24,21 +19,8 @@ pub struct SdoExpedited {
 }
 
 impl SdoExpedited {
-    pub fn download(
-        counter: u8,
-        index: u16,
-        access: SubIndex,
-        data: [u8; 4],
-        len: u8,
-    ) -> SdoExpedited {
+    pub fn download(index: u16, access: SubIndex, data: [u8; 4], len: u8) -> SdoExpedited {
         SdoExpedited {
-            header: MailboxHeader {
-                length: 0x0a,
-                // address: 0x0000,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoRequest,
             },
@@ -80,10 +62,8 @@ impl Display for SdoExpedited {
 ///
 /// See ETG1000.6 Section 5.6.2 SDO.
 #[derive(Debug, Copy, Clone, PartialEq, ethercrab_wire::EtherCrabWireReadWrite)]
-#[wire(bytes = 12)]
+#[wire(bytes = 6)]
 pub struct SdoNormal {
-    #[wire(bytes = 6)]
-    pub header: MailboxHeader,
     #[wire(bytes = 2)]
     pub coe_header: CoeHeader,
     #[wire(bytes = 4)]
@@ -91,15 +71,8 @@ pub struct SdoNormal {
 }
 
 impl SdoNormal {
-    pub fn upload(counter: u8, index: u16, access: SubIndex) -> SdoNormal {
+    pub fn upload(index: u16, access: SubIndex) -> SdoNormal {
         SdoNormal {
-            header: MailboxHeader {
-                length: 0x0a,
-                // address: 0x0000,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoRequest,
             },
@@ -134,12 +107,33 @@ impl Display for SdoNormal {
     }
 }
 
+/// An SDO upload (read) request. An SDO up/download frame is a fixed 10 bytes; an upload carries no
+/// data, so the trailing 4 bytes are reserved and sent as zero (the derive zero-fills them).
+#[derive(Debug, Copy, Clone, PartialEq, ethercrab_wire::EtherCrabWireReadWrite)]
+#[wire(bytes = 10)]
+pub struct SdoUploadRequest {
+    #[wire(bytes = 6, post_skip_bytes = 4)]
+    pub sdo: SdoNormal,
+}
+
+impl SdoUploadRequest {
+    pub fn new(index: u16, access: SubIndex) -> SdoUploadRequest {
+        SdoUploadRequest {
+            sdo: SdoNormal::upload(index, access),
+        }
+    }
+}
+
+impl CoeServiceRequest for SdoUploadRequest {
+    fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool {
+        self.sdo.validate_response(received_index, received_subindex)
+    }
+}
+
 /// Headers belonging to segmented SDO transfers.
 #[derive(Debug, Copy, Clone, ethercrab_wire::EtherCrabWireReadWrite)]
-#[wire(bytes = 9)]
+#[wire(bytes = 3)]
 pub struct SdoSegmented {
-    #[wire(bytes = 6)]
-    pub header: MailboxHeader,
     #[wire(bytes = 2)]
     pub coe_header: CoeHeader,
     #[wire(bytes = 1)]
@@ -147,15 +141,8 @@ pub struct SdoSegmented {
 }
 
 impl SdoSegmented {
-    pub fn upload(counter: u8, toggle: bool) -> SdoSegmented {
+    pub fn upload(toggle: bool) -> SdoSegmented {
         SdoSegmented {
-            header: MailboxHeader {
-                length: 0x0a,
-                // address: 0x0000,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoRequest,
             },
@@ -178,12 +165,33 @@ impl Display for SdoSegmented {
     }
 }
 
+/// A segmented SDO upload request, padded to the fixed 10-byte SDO frame; the trailing 7 bytes are
+/// reserved and sent as zero.
+#[derive(Debug, Copy, Clone, ethercrab_wire::EtherCrabWireReadWrite)]
+#[wire(bytes = 10)]
+pub struct SdoSegmentedUploadRequest {
+    #[wire(bytes = 3, post_skip_bytes = 7)]
+    pub sdo: SdoSegmented,
+}
+
+impl SdoSegmentedUploadRequest {
+    pub fn new(toggle: bool) -> SdoSegmentedUploadRequest {
+        SdoSegmentedUploadRequest {
+            sdo: SdoSegmented::upload(toggle),
+        }
+    }
+}
+
+impl CoeServiceRequest for SdoSegmentedUploadRequest {
+    fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool {
+        self.sdo.validate_response(received_index, received_subindex)
+    }
+}
+
 /// Defined in ETG.1000.6 §5.6.3.3.1
 #[derive(Debug, Copy, Clone, PartialEq, ethercrab_wire::EtherCrabWireReadWrite)]
-#[wire(bytes = 14)]
+#[wire(bytes = 8)]
 pub struct ObjectDescriptionListRequest {
-    #[wire(bytes = 6)]
-    pub header: MailboxHeader,
     #[wire(bytes = 2)]
     pub coe_header: CoeHeader,
     #[wire(bytes = 4)]
@@ -194,17 +202,9 @@ pub struct ObjectDescriptionListRequest {
 
 impl ObjectDescriptionListRequest {
     pub fn get_object_description_list(
-        counter: u8,
         list_type: ObjectDescriptionListQuery,
     ) -> ObjectDescriptionListRequest {
         ObjectDescriptionListRequest {
-            header: MailboxHeader {
-                length: 0x08,
-                // address: 0x0000,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoInformation,
             },
@@ -217,15 +217,8 @@ impl ObjectDescriptionListRequest {
         }
     }
 
-    pub fn get_object_quantities(counter: u8) -> ObjectDescriptionListRequest {
+    pub fn get_object_quantities() -> ObjectDescriptionListRequest {
         ObjectDescriptionListRequest {
-            header: MailboxHeader {
-                length: 0x08,
-                // address: 0x0000,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoInformation,
             },
@@ -241,10 +234,8 @@ impl ObjectDescriptionListRequest {
 
 /// Defined in ETG.1000.6 §5.6.3.3.2
 #[derive(Debug, Copy, Clone, PartialEq, ethercrab_wire::EtherCrabWireReadWrite)]
-#[wire(bytes = 12)]
+#[wire(bytes = 6)]
 pub struct ObjectDescriptionListResponse {
-    #[wire(bytes = 6)]
-    pub mailbox: MailboxHeader,
     #[wire(bytes = 2)]
     pub coe_header: CoeHeader,
     #[wire(bytes = 4)]
@@ -386,16 +377,9 @@ mod tests {
 
     #[test]
     fn decode_sdo_response_normal() {
-        let raw = [10u8, 0, 0, 0, 0, 83, 0, 48, 79, 0, 28, 4];
+        let raw = [0u8, 48, 79, 0, 28, 4];
 
         let expected = SdoNormal {
-            header: MailboxHeader {
-                length: 10,
-                // address: 0,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter: 5,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoResponse,
             },
@@ -417,18 +401,11 @@ mod tests {
     fn encode_sdo_request() {
         let buf = [0xaau8, 0xbb, 0xcc, 0xdd];
 
-        let request = SdoExpedited::download(123, 0x1234, 3.into(), buf, buf.packed_len() as u8);
+        let request = SdoExpedited::download(0x1234, 3.into(), buf, buf.packed_len() as u8);
 
         pretty_assertions::assert_eq!(
             request,
             SdoExpedited {
-                header: MailboxHeader {
-                    length: 10,
-                    // address: 0,
-                    priority: Priority::Lowest,
-                    mailbox_type: MailboxType::Coe,
-                    counter: 123,
-                },
                 coe_header: CoeHeader {
                     service: CoeService::SdoRequest,
                 },
@@ -451,18 +428,11 @@ mod tests {
         let buf = [0xaau8, 0xbb, 0xcc, 0xdd];
 
         let request =
-            SdoExpedited::download(123, 0x1234, SubIndex::Complete, buf, buf.packed_len() as u8);
+            SdoExpedited::download(0x1234, SubIndex::Complete, buf, buf.packed_len() as u8);
 
         pretty_assertions::assert_eq!(
             request,
             SdoExpedited {
-                header: MailboxHeader {
-                    length: 10,
-                    // address: 0,
-                    priority: Priority::Lowest,
-                    mailbox_type: MailboxType::Coe,
-                    counter: 123,
-                },
                 coe_header: CoeHeader {
                     service: CoeService::SdoRequest,
                 },
@@ -483,18 +453,11 @@ mod tests {
 
     #[test]
     fn upload_request_normal() {
-        let request = SdoNormal::upload(210, 0x4567, 2.into());
+        let request = SdoNormal::upload(0x4567, 2.into());
 
         pretty_assertions::assert_eq!(
             request,
             SdoNormal {
-                header: MailboxHeader {
-                    length: 10,
-                    // address: 0,
-                    priority: Priority::Lowest,
-                    mailbox_type: MailboxType::Coe,
-                    counter: 210,
-                },
                 coe_header: CoeHeader {
                     service: CoeService::SdoRequest,
                 },
@@ -514,20 +477,12 @@ mod tests {
     #[test]
     fn upload_request_response_segmented() {
         let raw = [
-            16u8, 0, 0, 0, 0, 99, 0, 48, 65, 8, 16, 0, 6, 0, 0, 0, 69, 75, 49, 57, 49, 52, 68, 105,
-            97, 103, 110, 111, 115, 101, 32, 77, 67, 50, 0, 86, 111, 108, 116, 97, 103, 101, 116,
-            97, 103, 101, 115, 105, 118, 101, 1, 112, 16, 112, 0, 128, 1, 128, 2, 128, 14, 128, 1,
-            144,
+            0u8, 48, 65, 8, 16, 0, 6, 0, 0, 0, 69, 75, 49, 57, 49, 52, 68, 105, 97, 103, 110, 111,
+            115, 101, 32, 77, 67, 50, 0, 86, 111, 108, 116, 97, 103, 101, 116, 97, 103, 101, 115,
+            105, 118, 101, 1, 112, 16, 112, 0, 128, 1, 128, 2, 128, 14, 128, 1, 144,
         ];
 
         let expected_headers = SdoNormal {
-            header: MailboxHeader {
-                length: 16,
-                // address: 0,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter: 6,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoResponse,
             },
@@ -543,27 +498,19 @@ mod tests {
         };
 
         pretty_assertions::assert_eq!(
-            SdoNormal::unpack_from_slice(&raw[0..12]),
+            SdoNormal::unpack_from_slice(&raw[0..6]),
             Ok(expected_headers)
         );
 
-        assert_eq!(&raw[(12 + u32::PACKED_LEN)..][..4], &[69, 75, 49, 57]);
+        assert_eq!(&raw[(6 + u32::PACKED_LEN)..][..4], &[69, 75, 49, 57]);
     }
 
     #[test]
     fn get_object_description_list() {
         // from Wireshark
-        let raw: [u8; 14] = [
-            0x8, 0x0, 0x0, 0x0, 0x0, 0x73, 0x0, 0x80, 0x1, 0x0, 0x0, 0x0, 0x1, 0x0,
-        ];
+        let raw: [u8; 8] = [0x0, 0x80, 0x1, 0x0, 0x0, 0x0, 0x1, 0x0];
         let parsed = ObjectDescriptionListRequest::unpack_from_slice(&raw);
         let expected = ObjectDescriptionListRequest {
-            header: MailboxHeader {
-                length: 8,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter: 7,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoInformation,
             },
@@ -581,27 +528,21 @@ mod tests {
             Ok(&raw[..ObjectDescriptionListRequest::PACKED_LEN])
         );
 
-        // from Wireshark
-        const RAW_LEN: usize = 128;
+        // from Wireshark (mailbox header stripped; this is the CoE body only)
+        const RAW_LEN: usize = 122;
         let raw: [u8; RAW_LEN] = [
-            0x7a, 0x0, 0x0, 0x0, 0x0, 0x73, 0x0, 0x80, 0x82, 0x0, 0x1, 0x0, 0x1, 0x0, 0x0, 0x10,
-            0x8, 0x10, 0x9, 0x10, 0xa, 0x10, 0x18, 0x10, 0x1, 0x16, 0x2, 0x16, 0x3, 0x16, 0x21,
-            0x16, 0x22, 0x16, 0x23, 0x16, 0x24, 0x16, 0x25, 0x16, 0x26, 0x16, 0x30, 0x16, 0x31,
-            0x16, 0x0, 0x1a, 0x1, 0x1a, 0x2, 0x1a, 0x3, 0x1a, 0x4, 0x1a, 0x5, 0x1a, 0x6, 0x1a, 0x7,
-            0x1a, 0x8, 0x1a, 0x9, 0x1a, 0xa, 0x1a, 0xb, 0x1a, 0xc, 0x1a, 0xd, 0x1a, 0xe, 0x1a, 0xf,
-            0x1a, 0x10, 0x1a, 0x11, 0x1a, 0x12, 0x1a, 0x13, 0x1a, 0x14, 0x1a, 0x15, 0x1a, 0x16,
-            0x1a, 0x17, 0x1a, 0x18, 0x1a, 0x19, 0x1a, 0x1a, 0x1a, 0x1b, 0x1a, 0x1c, 0x1a, 0x1d,
-            0x1a, 0x1e, 0x1a, 0x1f, 0x1a, 0x20, 0x1a, 0x21, 0x1a, 0x22, 0x1a, 0x23, 0x1a, 0x24,
-            0x1a, 0x25, 0x1a, 0x26, 0x1a, 0x30, 0x1a, 0x31, 0x1a,
+            0x0, 0x80, 0x82, 0x0, 0x1, 0x0, 0x1, 0x0, 0x0, 0x10, 0x8, 0x10, 0x9, 0x10, 0xa, 0x10,
+            0x18, 0x10, 0x1, 0x16, 0x2, 0x16, 0x3, 0x16, 0x21, 0x16, 0x22, 0x16, 0x23, 0x16, 0x24,
+            0x16, 0x25, 0x16, 0x26, 0x16, 0x30, 0x16, 0x31, 0x16, 0x0, 0x1a, 0x1, 0x1a, 0x2, 0x1a,
+            0x3, 0x1a, 0x4, 0x1a, 0x5, 0x1a, 0x6, 0x1a, 0x7, 0x1a, 0x8, 0x1a, 0x9, 0x1a, 0xa, 0x1a,
+            0xb, 0x1a, 0xc, 0x1a, 0xd, 0x1a, 0xe, 0x1a, 0xf, 0x1a, 0x10, 0x1a, 0x11, 0x1a, 0x12,
+            0x1a, 0x13, 0x1a, 0x14, 0x1a, 0x15, 0x1a, 0x16, 0x1a, 0x17, 0x1a, 0x18, 0x1a, 0x19,
+            0x1a, 0x1a, 0x1a, 0x1b, 0x1a, 0x1c, 0x1a, 0x1d, 0x1a, 0x1e, 0x1a, 0x1f, 0x1a, 0x20,
+            0x1a, 0x21, 0x1a, 0x22, 0x1a, 0x23, 0x1a, 0x24, 0x1a, 0x25, 0x1a, 0x26, 0x1a, 0x30,
+            0x1a, 0x31, 0x1a,
         ];
         let parsed = ObjectDescriptionListResponse::unpack_from_slice(&raw);
         let expected = ObjectDescriptionListResponse {
-            mailbox: MailboxHeader {
-                length: 122,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter: 7,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoInformation,
             },
@@ -637,22 +578,12 @@ mod tests {
 
     #[test]
     fn error_not_found() {
-        // Copypasta'd from Wireshark
-        let raw = [
-            0x0a, 0x00, 0x00, 0x00, 0x00, 0x63, 0x00, 0x20, 0x80, 0x01, 0x10, 0x00, 0x00, 0x00,
-            0x02, 0x06,
-        ];
+        // Mailbox header stripped; these bytes are the CoE body only, as the transport hands it up.
+        let raw = [0x00, 0x20, 0x80, 0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x06];
 
         let parsed = SdoNormal::unpack_from_slice(&raw);
 
         let expected = SdoNormal {
-            header: MailboxHeader {
-                length: 0x0a,
-                // address: 0x0000,
-                priority: Priority::Lowest,
-                mailbox_type: MailboxType::Coe,
-                counter: 6,
-            },
             coe_header: CoeHeader {
                 service: CoeService::SdoRequest,
             },
@@ -667,7 +598,7 @@ mod tests {
             },
         };
 
-        let abort_code = CoeAbortCode::unpack_from_slice(&raw[12..]);
+        let abort_code = CoeAbortCode::unpack_from_slice(&raw[6..]);
 
         assert_eq!(abort_code, Ok(CoeAbortCode::NotFound));
 

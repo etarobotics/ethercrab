@@ -100,6 +100,24 @@ impl WrappedWrite {
         Ok(())
     }
 
+    /// Send a payload padded to [`with_len`](WrappedWrite::with_len) and require the working
+    /// counter to match (default 1).
+    ///
+    /// Unlike [`send`](WrappedWrite::send) — which discards the WKC — this confirms the write was
+    /// accepted by the SubDevice, as the mailbox delivery guarantee requires. `send_receive_slice`
+    /// is unsuitable because it drops `len_override`, and a mailbox write must span the whole SM
+    /// window for the ESC to flip the SM full.
+    pub async fn send_wkc<'maindevice>(
+        self,
+        maindevice: &'maindevice MainDevice<'maindevice>,
+        data: impl EtherCrabWireWrite,
+    ) -> Result<(), Error> {
+        self.common(maindevice, data, self.len_override)
+            .await?
+            .maybe_wkc(self.wkc)
+            .map(|_| ())
+    }
+
     /// Send a value, returning the response returned from the network.
     pub async fn send_receive<'maindevice, T>(
         self,
