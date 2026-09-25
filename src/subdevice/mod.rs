@@ -845,36 +845,52 @@ where
         Ok((read, write))
     }
 
-    /// Send a raw framed message to the SubDevice mailbox with the ETG.1000.4 delivery guarantee.
+    /// Send a framed message of the given mailbox protocol to the SubDevice mailbox with the
+    /// ETG.1000.4 delivery guarantee.
     ///
     /// Returns `Ok(())` only once the frame is latched in the MailboxOut SM (confirmed `WKC == 1`),
     /// so the SubDevice is guaranteed to receive `data`. It does *not* wait for the SubDevice to
     /// process it — that is what a response ([`mailbox_read`](Self::mailbox_read)) is for.
     ///
-    /// The message rides as [`MailboxType::VendorSpecific`](crate::MailboxType) — a raw pipe that
-    /// CoE/SDO tooling will not interpret. Retransmissions reuse the same mailbox counter, so a
-    /// SubDevice can discard a duplicate arising from a lost acknowledgement.
-    pub async fn mailbox_write(&self, data: &[u8]) -> Result<(), Error> {
+    /// `mailbox_type` selects the protocol the body carries (e.g. [`MailboxType::Coe`] or
+    /// [`MailboxType::Foe`]); the caller owns everything after the 6-byte header. `body` is any
+    /// [`EtherCrabWireWrite`] — a raw `&[u8]` or a typed protocol frame — and is packed directly
+    /// into the send frame after the mailbox header, with no intermediate buffer. Retransmissions
+    /// reuse the same mailbox counter, so a SubDevice can discard a duplicate arising from a lost
+    /// acknowledgement.
+    pub async fn mailbox_write(
+        &self,
+        mailbox_type: MailboxType,
+        body: impl ethercrab_wire::EtherCrabWireWrite,
+    ) -> Result<(), Error> {
         let (_read, write_mailbox) = self.mailbox_windows()?;
 
         // One counter for the whole call: if a write latches but its WKC reply is lost, the retry
         // re-sends the *same* counter once the SM drains, and the SubDevice dedups on it.
         let counter = self.mailbox_counter();
 
+        let body_len = body.packed_len();
+
         let window = usize::from(write_mailbox.len);
-        let mut buf = [0u8; crate::raw_mailbox::MAILBOX_MAX_LEN];
-        let out = buf
-            .get_mut(..window)
-            .ok_or(Error::Mailbox(MailboxError::TooLong {
+        // Checked before packing: `pack_to_slice_unchecked` in the send path panics on a short
+        // buffer, so an oversized body must be rejected here rather than reaching it.
+        if crate::raw_mailbox::MailboxHeader::PACKED_LEN + body_len > window {
+            return Err(Error::Mailbox(MailboxError::TooLong {
                 address: 0,
                 sub_index: 0,
-            }))?;
-        let len = crate::raw_mailbox::build_frame(
-            counter,
-            MailboxType::VendorSpecific,
-            data,
-            out,
-        )?;
+            }));
+        }
+
+        // Packed straight into the send frame by the PDU layer — no scratch buffer.
+        let frame = crate::raw_mailbox::MailboxFrame {
+            header: crate::raw_mailbox::MailboxHeader {
+                length: body_len as u16,
+                priority: crate::mailbox::Priority::Lowest,
+                mailbox_type,
+                counter,
+            },
+            body,
+        };
 
         let write_sm_status = RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
 
@@ -896,7 +912,8 @@ where
                 match self
                     .write(write_mailbox.address)
                     .with_len(write_mailbox.len)
-                    .send_wkc(self.maindevice, &buf[..len])
+                    // Borrowed, not moved: the loop may retry this send on a dropped datagram.
+                    .send_wkc(self.maindevice, &frame)
                     .await
                 {
                     Ok(()) => break Ok(()),
@@ -921,7 +938,7 @@ where
     async fn read_mailbox_once(
         &self,
         read_mailbox: &Mailbox,
-    ) -> Result<Option<crate::raw_mailbox::MailboxMessage>, Error> {
+    ) -> Result<Option<crate::raw_mailbox::MailboxMessage<'maindevice>>, Error> {
         let read_sm_status = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
 
         let sm_status = self
@@ -952,7 +969,7 @@ where
         .timeout(self.maindevice.timeouts.mailbox_echo)
         .await?;
 
-        crate::raw_mailbox::parse_frame(&window).map(Some)
+        crate::raw_mailbox::MailboxMessage::parse(window).map(Some)
     }
 
     /// Read a raw framed message from the SubDevice mailbox, blocking until one arrives or the
@@ -960,7 +977,9 @@ where
     ///
     /// EtherCAT SubDevices never push, so this polls the MailboxIn SM. A timeout means the
     /// SubDevice produced nothing in time (e.g. it is still processing a request).
-    pub async fn mailbox_read(&self) -> Result<crate::raw_mailbox::MailboxMessage, Error> {
+    pub async fn mailbox_read(
+        &self,
+    ) -> Result<crate::raw_mailbox::MailboxMessage<'maindevice>, Error> {
         let (read_mailbox, _write) = self.mailbox_windows()?;
 
         async {
