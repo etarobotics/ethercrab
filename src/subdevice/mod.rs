@@ -9,17 +9,16 @@ use crate::{
     al_control::AlControl,
     al_status_code::AlStatusCode,
     coe::{
-        self, abort_code::CoeAbortCode, services::CoeServiceRequest, CoeCommand, CoeService,
-        SdoExpedited, SubIndex,
+        self, abort_code::CoeAbortCode, services::CoeServiceRequest, CoeCommand, CoeHeader,
+        CoeService, SdoExpedited, SubIndex,
     },
     command::Command,
     dl_status::DlStatus,
     eeprom::{device_provider::DeviceEeprom, types::SiiOwner},
     error::{Error, IgnoreNoCategory, Item, MailboxError, PduError},
     fmt,
-    mailbox::{MailboxHeader, MailboxType},
+    mailbox::MailboxType,
     maindevice::MainDevice,
-    pdu_loop::ReceivedPdu,
     register::{DcSupport, RegisterAddress, SupportFlags},
     subdevice::{ports::Ports, types::SubDeviceConfig},
     subdevice_state::SubDeviceState,
@@ -538,195 +537,40 @@ where
         ))
     }
 
-    /// Get CoE read/write mailboxes.
-    async fn coe_mailboxes(&self) -> Result<(Mailbox, Mailbox), Error> {
-        let write_mailbox = self
-            .state
-            .config
-            .mailbox
-            .write
-            .ok_or(Error::Mailbox(MailboxError::NoMailbox))
-            .map_err(|e| {
-                fmt::error!("No write (SubDevice IN) mailbox found but one is required");
-                e
-            })?;
-        let read_mailbox = self
-            .state
-            .config
-            .mailbox
-            .read
-            .ok_or(Error::Mailbox(MailboxError::NoMailbox))
-            .map_err(|e| {
-                fmt::error!("No read (SubDevice OUT) mailbox found but one is required");
-                e
-            })?;
-
-        let mailbox_read_sm_status =
-            RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
-        let mailbox_write_sm_status =
-            RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
-
-        // Ensure SubDevice OUT (master IN) mailbox is empty. We'll retry this multiple times in
-        // case the SubDevice is still busy or bugged or something.
-        for i in 0..10 {
-            let sm_status = self
-                .read(mailbox_read_sm_status)
-                .receive::<crate::sync_manager_channel::Status>(self.maindevice)
-                .await?;
-
-            // If flag is set, read entire mailbox to clear it
-            if sm_status.mailbox_full {
-                fmt::debug!(
-                    "SubDevice {:#06x} OUT mailbox not empty (status {:?}). Clearing.",
-                    self.configured_address(),
-                    sm_status
-                );
-
-                self.read(read_mailbox.address)
-                    .ignore_wkc()
-                    .receive_slice(self.maindevice, read_mailbox.len)
-                    .await?;
-            } else {
+    /// Send a CoE service over the shared mailbox transport, wait for the response, validate it and
+    /// return the parsed response header plus the response message.
+    ///
+    /// The CoE body follows the 6-byte mailbox header the transport owns; SDO data (if any) begins
+    /// at [`SdoNormal::PACKED_LEN`](crate::coe::services::SdoNormal) into the returned message body.
+    async fn send_coe_service<R>(
+        &self,
+        request: R,
+    ) -> Result<(R, crate::raw_mailbox::MailboxMessage<'maindevice>), Error>
+    where
+        R: CoeServiceRequest,
+    {
+        // Clear any stale response a previous aborted transaction left latched in the read mailbox,
+        // so it is not mistaken for this request's reply.
+        for _ in 0..10 {
+            if self.try_mailbox_read().await?.is_none() {
                 break;
             }
-
-            // Don't delay on first iteration
-            if i > 0 {
-                self.maindevice.timeouts.loop_tick().await;
-            }
-
-            if i > 1 {
-                fmt::debug!("--> Retrying clear");
-            }
         }
 
-        // Wait for SubDevice IN mailbox to be available to receive data from master
-        async {
-            loop {
-                let sm_status = self
-                    .read(mailbox_write_sm_status)
-                    .receive::<crate::sync_manager_channel::Status>(self.maindevice)
-                    .await?;
+        self.mailbox_write(MailboxType::Coe, &request).await?;
 
-                if !sm_status.mailbox_full {
-                    break Ok(());
-                }
-
-                self.maindevice.timeouts.loop_tick().await;
-            }
-        }
-        .timeout(self.maindevice.timeouts.mailbox_echo)
-        .await
-        .map_err(|e| {
-            fmt::error!(
-                "Mailbox IN ready error for SubDevice {:#06x}: {}",
-                self.configured_address,
-                e
-            );
-
-            e
-        })?;
-
-        Ok((read_mailbox, write_mailbox))
-    }
-
-    /// Wait for a mailbox response
-    async fn coe_response(&self, read_mailbox: &Mailbox) -> Result<ReceivedPdu, Error> {
-        let mailbox_read_sm = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
-
-        // Wait for SubDevice OUT mailbox to be ready
-        async {
-            let mut no_response = 0u32;
-
-            loop {
-                // WKC≠1 means the subdevice didn't answer this SM-status read (starved/absent), not
-                // that the mailbox is empty. Treat it as "retry", not a hard error, so a transient
-                // miss doesn't abort the whole SDO — but surface persistent silence rather than
-                // letting it look like a plain mailbox_echo timeout.
-                match self
-                    .read(mailbox_read_sm)
-                    .receive::<crate::sync_manager_channel::Status>(self.maindevice)
-                    .await
-                {
-                    Ok(sm_status) => {
-                        no_response = 0;
-
-                        if sm_status.mailbox_full {
-                            break Ok(());
-                        }
-                    }
-                    Err(Error::WorkingCounter { .. }) => {
-                        no_response += 1;
-
-                        if no_response % 500 == 0 {
-                            fmt::warn!(
-                                "SubDevice {:#06x}: {} consecutive mailbox SM-status reads returned \
-                                 WKC=0 — subdevice not responding (not present, or its ESC register \
-                                 bus is starved by PDI activity)",
-                                self.configured_address,
-                                no_response,
-                            );
-                        }
-                    }
-                    Err(e) => break Err(e),
-                }
-
-                self.maindevice.timeouts.loop_tick().await;
-            }
-        }
-        .timeout(self.maindevice.timeouts.mailbox_echo)
-        .await
-        .map_err(|e| {
-            fmt::error!(
-                "Response mailbox IN error for SubDevice {:#06x}: {}",
-                self.configured_address,
-                e
-            );
-
-            e
-        })?;
-
-        // Read acknowledgement from SubDevice OUT mailbox
-        let response = self
-            .read(read_mailbox.address)
-            .receive_slice(self.maindevice, read_mailbox.len)
-            .await?;
-
-        // TODO: Retries. Refer to SOEM's `ecx_mbxreceive` for inspiration
-
-        Ok(response)
-    }
-
-    /// Send a mailbox request, wait for response mailbox to be ready, read response from mailbox
-    /// and return as a slice.
-    async fn send_coe_service<R>(&'maindevice self, request: R) -> Result<(R, ReceivedPdu), Error>
-    where
-        R: CoeServiceRequest + Debug,
-    {
-        let (read_mailbox, write_mailbox) = self.coe_mailboxes().await?;
-
-        let counter = request.counter();
-
-        // Send data to SubDevice IN mailbox
-        self.write(write_mailbox.address)
-            .with_len(write_mailbox.len)
-            .send(self.maindevice, &request.pack().as_ref())
-            .await?;
-
-        let mut response = self.coe_response(&read_mailbox).await?;
+        let response = self.mailbox_read().await?;
 
         /// A super generalised version of the various header shapes for responses, extracting only
-        /// what we need in this method.
+        /// what we need in this method, parsed from the CoE body (after the mailbox header).
         #[derive(Clone, Copy, Debug, PartialEq, Eq, ethercrab_wire::EtherCrabWireRead)]
-        #[wire(bytes = 12)]
-        struct HeadersRaw {
-            #[wire(bytes = 8)]
-            header: MailboxHeader,
+        #[wire(bytes = 6)]
+        struct ResponseHeaders {
+            #[wire(bytes = 2)]
+            coe: CoeHeader,
 
             #[wire(pre_skip = 5, bits = 3)]
             command: CoeCommand,
-
-            // 9 bytes up to here
 
             // SAFETY: These fields will be garbage (but not invalid) if the response is NOT an
             // abort transfer request. Use with caution!
@@ -736,19 +580,11 @@ where
             sub_index: u8,
         }
 
-        let headers = HeadersRaw::unpack_from_slice(&response)?;
+        let headers = ResponseHeaders::unpack_from_slice(response.body())?;
 
-        assert_ne!(headers.header.service, CoeService::Emergency);
+        assert_ne!(headers.coe.service, CoeService::Emergency);
 
-        if headers.header.counter != counter {
-            fmt::warn!(
-                "Invalid count received: {} (expected {})",
-                headers.header.counter,
-                counter
-            );
-        }
-
-        if headers.header.service == CoeService::Emergency {
+        if headers.coe.service == CoeService::Emergency {
             #[derive(Debug, Copy, Clone, ethercrab_wire::EtherCrabWireRead)]
             #[wire(bytes = 8)]
             struct EmergencyData {
@@ -760,9 +596,12 @@ where
                 extra_data: [u8; 5],
             }
 
-            response.trim_front(HeadersRaw::PACKED_LEN);
-
-            let decoded = EmergencyData::unpack_from_slice(&response)?;
+            let decoded = EmergencyData::unpack_from_slice(
+                response
+                    .body()
+                    .get(ResponseHeaders::PACKED_LEN..)
+                    .ok_or(Error::Internal)?,
+            )?;
 
             #[cfg(not(feature = "defmt"))]
             fmt::error!(
@@ -800,12 +639,12 @@ where
             }))
         }
         // Validate that the mailbox response is to the request we just sent
-        else if headers.header.mailbox_type != MailboxType::Coe
+        else if response.mailbox_type() != MailboxType::Coe
             || !request.validate_response(headers.address, headers.sub_index)
         {
             fmt::error!(
                 "Invalid SDO response. Type: {:?} (expected {:?}), index {}, subindex {}",
-                headers.header.mailbox_type,
+                response.mailbox_type(),
                 MailboxType::Coe,
                 headers.address,
                 headers.sub_index,
@@ -816,18 +655,13 @@ where
                 sub_index: headers.sub_index,
             }))
         } else {
-            let headers = R::unpack_from_slice(&response)?;
+            let parsed = R::unpack_from_slice(response.body())?;
 
-            response.trim_front(HeadersRaw::PACKED_LEN);
-
-            Ok((headers, response))
+            Ok((parsed, response))
         }
     }
 
     /// Resolve the SubDevice's read (SubDevice OUT) and write (SubDevice IN) mailbox windows.
-    ///
-    /// Unlike [`coe_mailboxes`](Self::coe_mailboxes) this does *not* pre-drain the read mailbox, so
-    /// a pending message is left intact for [`mailbox_read`](Self::mailbox_read).
     fn mailbox_windows(&self) -> Result<(Mailbox, Mailbox), Error> {
         let read = self
             .state
@@ -1109,8 +943,6 @@ where
     {
         let sub_index = sub_index.into();
 
-        let counter = self.mailbox_counter();
-
         if value.packed_len() > 4 {
             fmt::error!("Only 4 byte SDO writes or smaller are supported currently.");
 
@@ -1122,8 +954,7 @@ where
 
         value.pack_to_slice(&mut buf)?;
 
-        let request =
-            coe::services::download(counter, index, sub_index, buf, value.packed_len() as u8);
+        let request = coe::services::download(index, sub_index, buf, value.packed_len() as u8);
 
         fmt::trace!("CoE download");
 
@@ -1267,12 +1098,15 @@ where
 
         let sub_index = sub_index.into();
 
-        let request = coe::services::upload(self.mailbox_counter(), index, sub_index);
+        let request = coe::services::upload(index, sub_index);
 
         fmt::trace!("CoE upload {:#06x} {:?}", index, sub_index);
 
         let (headers, response) = self.send_coe_service(request).await?;
-        let data: &[u8] = &response;
+        let data = response
+            .body()
+            .get(coe::services::SdoNormal::PACKED_LEN..)
+            .ok_or(Error::Internal)?;
 
         // Expedited transfers where the data is 4 bytes or less long, denoted in the SDO header
         // size value.
@@ -1297,12 +1131,15 @@ where
         let mut storage = T::buffer();
         let buf = storage.as_mut();
 
-        let request = coe::services::upload(self.mailbox_counter(), index, sub_index);
+        let request = coe::services::upload(index, sub_index);
 
         fmt::trace!("CoE upload {:#06x} {:?}", index, sub_index);
 
         let (headers, response) = self.send_coe_service(request).await?;
-        let data: &[u8] = &response;
+        let data = response
+            .body()
+            .get(coe::services::SdoNormal::PACKED_LEN..)
+            .ok_or(Error::Internal)?;
 
         // Expedited transfers where the data is 4 bytes or less long, denoted in the SDO header
         // size value.
@@ -1313,7 +1150,7 @@ where
         }
         // Data is either a normal upload or a segmented upload
         else {
-            let data_length = headers.header.length.saturating_sub(0x0a);
+            let data_length = response.header().length.saturating_sub(0x0a);
 
             let complete_size = u32::unpack_from_slice(data)?;
             let data = data.get(u32::PACKED_LEN..).ok_or(Error::Internal)?;
@@ -1338,15 +1175,19 @@ where
                 let mut total_len = 0usize;
 
                 loop {
-                    let request = coe::services::upload_segmented(self.mailbox_counter(), toggle);
+                    let request = coe::services::upload_segmented(toggle);
 
                     fmt::trace!("CoE upload segmented");
 
-                    let (headers, data) = self.send_coe_service(request).await?;
+                    let (headers, seg_response) = self.send_coe_service(request).await?;
+                    let data = seg_response
+                        .body()
+                        .get(coe::services::SdoNormal::PACKED_LEN..)
+                        .ok_or(Error::Internal)?;
 
                     // The spec defines the data length as n-3, so we'll just go with that magic
                     // number...
-                    let mut chunk_len = usize::from(headers.header.length - 3);
+                    let mut chunk_len = usize::from(seg_response.header().length - 3);
 
                     // Special case as per spec: Minimum response size is 7 bytes. For smaller
                     // responses, we must remove the number of unused bytes at the end of the
@@ -1440,7 +1281,7 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
         futures_lite::future::try_zip(self.state(), code).await
     }
 
-    fn eeprom(&self) -> SubDeviceEeprom<DeviceEeprom> {
+    fn eeprom(&self) -> SubDeviceEeprom<DeviceEeprom<'_>> {
         SubDeviceEeprom::new(DeviceEeprom::new(self.maindevice, self.configured_address))
     }
 
