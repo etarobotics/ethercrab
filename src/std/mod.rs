@@ -7,6 +7,7 @@ mod unix;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::{
     sync::Arc,
     task::Wake,
@@ -21,10 +22,14 @@ pub use unix::{ethercat_now, tx_rx_task};
 #[cfg(target_os = "linux")]
 pub use io_uring::tx_rx_task_io_uring;
 
+// Only the io_uring (Linux) and Windows blocking TX/RX loops park a thread this way; the generic
+// unix loop (e.g. macOS) does not, so it would otherwise be dead code there.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct ParkSignal {
     current_thread: Thread,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl ParkSignal {
     fn new() -> Self {
         Self {
@@ -35,12 +40,9 @@ impl ParkSignal {
     fn wait(&self) {
         thread::park();
     }
-
-    // fn wait_timeout(&self, timeout: Duration) {
-    //     thread::park_timeout(timeout)
-    // }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl Wake for ParkSignal {
     fn wake(self: Arc<Self>) {
         self.current_thread.unpark();

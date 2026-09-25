@@ -169,6 +169,12 @@ impl<const N: usize, const DATA: usize> PduStorage<N, DATA> {
     }
 }
 
+impl<const N: usize, const DATA: usize> Default for PduStorage<N, DATA> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PduStorageRef<'sto> {
     frames: NonNull<FrameElement<0>>,

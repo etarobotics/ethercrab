@@ -343,9 +343,9 @@ impl SubDevice {
             .eeprom()
             .start_at(start_word, T::PACKED_LEN as u16);
 
-        let res = writer.write_all(value.pack().as_ref()).await?;
+        writer.write_all(value.pack().as_ref()).await?;
 
-        Ok(res)
+        Ok(())
     }
 
     /// Get additional identifying details for the SubDevice.
