@@ -1001,10 +1001,98 @@ where
     /// (and, if a message is present, reads it out).
     pub async fn try_mailbox_read(
         &self,
-    ) -> Result<Option<crate::raw_mailbox::MailboxMessage>, Error> {
+    ) -> Result<Option<crate::raw_mailbox::MailboxMessage<'maindevice>>, Error> {
         let (read_mailbox, _write) = self.mailbox_windows()?;
 
         self.read_mailbox_once(&read_mailbox).await
+    }
+
+    /// Upload a file from the SubDevice over File over EtherCAT (FoE).
+    ///
+    /// Reads `filename` (with the given FoE `password`, `0` when none is required) into `dest`,
+    /// returning the number of bytes written. Fails with [`Error::Foe`] carrying
+    /// [`FoeError::DestTooSmall`](crate::error::FoeError::DestTooSmall) if the file is larger than
+    /// `dest`.
+    ///
+    /// A transfer holds the SubDevice's mailbox for its whole duration and should be run before
+    /// cyclic operation (PRE-OP/SAFE-OP), not while the process data is exchanged in OP.
+    pub async fn foe_read(
+        &self,
+        filename: &str,
+        password: u32,
+        dest: &mut [u8],
+    ) -> Result<usize, Error> {
+        use crate::foe::read::{FoeRead, Progress};
+
+        fn copy_into(dest: &mut [u8], written: usize, bytes: &[u8]) -> Result<usize, Error> {
+            let capacity = dest.len();
+            let end = written + bytes.len();
+            dest.get_mut(written..end)
+                .ok_or(Error::Foe(crate::error::FoeError::DestTooSmall { capacity }))?
+                .copy_from_slice(bytes);
+            Ok(end)
+        }
+
+        let mut transfer = FoeRead::new(filename, password, self.foe_mailbox_payload()?)
+            .map_err(Error::Foe)?;
+        let mut written = 0;
+
+        loop {
+            self.mailbox_write(MailboxType::Foe, transfer.frame()).await?;
+
+            let reply = self.mailbox_read().await?;
+
+            match transfer.advance(reply.body()).map_err(Error::Foe)? {
+                Progress::Busy => continue,
+                Progress::Chunk(bytes) => written = copy_into(dest, written, bytes)?,
+                Progress::Last(bytes) => {
+                    written = copy_into(dest, written, bytes)?;
+                    // Acknowledge the final packet so the SubDevice sees the transfer complete.
+                    self.mailbox_write(MailboxType::Foe, transfer.frame()).await?;
+                    return Ok(written);
+                }
+            }
+        }
+    }
+
+    /// Download a file to the SubDevice over File over EtherCAT (FoE), e.g. a firmware image or a
+    /// configuration file.
+    ///
+    /// Writes `data` to `filename` (with the given FoE `password`, `0` when none is required).
+    ///
+    /// A transfer holds the SubDevice's mailbox for its whole duration and should be run before
+    /// cyclic operation (PRE-OP/SAFE-OP, or the dedicated bootstrap state for a firmware update),
+    /// not while the process data is exchanged in OP.
+    pub async fn foe_write(
+        &self,
+        filename: &str,
+        password: u32,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        use crate::foe::write::{FoeWrite, Progress};
+
+        let mut transfer = FoeWrite::new(filename, password, data, self.foe_mailbox_payload()?)
+            .map_err(Error::Foe)?;
+
+        loop {
+            self.mailbox_write(MailboxType::Foe, transfer.frame()).await?;
+
+            let reply = self.mailbox_read().await?;
+
+            match transfer.advance(reply.body()).map_err(Error::Foe)? {
+                Progress::Busy | Progress::More => continue,
+                Progress::Done => return Ok(()),
+            }
+        }
+    }
+
+    /// The largest FoE payload the SubDevice's mailbox can carry: the smaller of the two mailbox SM
+    /// windows, less the 6-byte mailbox header. Both directions must hold a full FoE frame.
+    fn foe_mailbox_payload(&self) -> Result<usize, Error> {
+        let (read_mailbox, write_mailbox) = self.mailbox_windows()?;
+
+        Ok(usize::from(read_mailbox.len.min(write_mailbox.len))
+            .saturating_sub(crate::raw_mailbox::MailboxHeader::PACKED_LEN))
     }
 
     /// Write a value to the given SDO index (address) and sub-index.
