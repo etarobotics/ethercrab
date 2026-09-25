@@ -4,8 +4,8 @@
 //! library alone — the crate's internal unit tests `include_bytes!` EEPROM fixtures that the
 //! published package excludes and so do not build in a vendored checkout.
 
-use ethercrab::raw_mailbox::{build_frame, parse_frame};
-use ethercrab::{MailboxHeader, MailboxType, Priority, MAILBOX_MAX_LEN};
+use ethercrab::raw_mailbox::parse_frame;
+use ethercrab::{MailboxFrame, MailboxHeader, MailboxType, Priority};
 use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireSized, EtherCrabWireWrite};
 
 #[test]
@@ -34,43 +34,82 @@ fn header_roundtrip_and_layout() {
 }
 
 #[test]
-fn build_then_parse_is_identity() {
+fn frame_packs_header_then_body() {
     let data = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+    let frame = MailboxFrame {
+        header: MailboxHeader {
+            length: data.len() as u16,
+            priority: Priority::Lowest,
+            mailbox_type: MailboxType::Foe,
+            counter: 3,
+        },
+        body: &data,
+    };
+
+    assert_eq!(frame.packed_len(), 6 + data.len());
+
     let mut window = [0u8; 64]; // oversized window, as the ESC SM would be
+    let packed = frame.pack_to_slice(&mut window).unwrap();
+    assert_eq!(packed.len(), 6 + data.len());
 
-    let n = build_frame(3, MailboxType::VendorSpecific, &data, &mut window).unwrap();
-    assert_eq!(n, 6 + data.len());
-
-    let msg = parse_frame(&window).unwrap();
-    assert_eq!(msg.header.counter, 3);
-    assert_eq!(msg.header.mailbox_type, MailboxType::VendorSpecific);
-    assert_eq!(msg.header.length as usize, data.len());
-    assert_eq!(&msg.body[..], &data[..]);
+    // The packed frame round-trips through the parser.
+    let (header, body) = parse_frame(&window).unwrap();
+    assert_eq!(header.counter, 3);
+    assert_eq!(header.mailbox_type, MailboxType::Foe);
+    assert_eq!(header.length as usize, data.len());
+    assert_eq!(body, &data[..]);
 }
 
 #[test]
 fn parse_ignores_window_padding_past_declared_length() {
     // A short body in a big window: trailing window bytes are not part of the message.
     let data = [0xaa, 0xbb];
+    let frame = MailboxFrame {
+        header: MailboxHeader {
+            length: data.len() as u16,
+            priority: Priority::Lowest,
+            mailbox_type: MailboxType::VendorSpecific,
+            counter: 1,
+        },
+        body: &data,
+    };
+
     let mut window = [0xffu8; 32];
-    build_frame(1, MailboxType::VendorSpecific, &data, &mut window).unwrap();
+    frame.pack_to_slice(&mut window).unwrap();
 
-    let msg = parse_frame(&window).unwrap();
-    assert_eq!(&msg.body[..], &data[..]);
+    let (_header, body) = parse_frame(&window).unwrap();
+    assert_eq!(body, &data[..]);
 }
 
 #[test]
-fn build_rejects_oversized_payload() {
-    // Body that would push the frame past MAILBOX_MAX_LEN.
-    let data = [0u8; MAILBOX_MAX_LEN];
-    let mut window = [0u8; MAILBOX_MAX_LEN + 16];
-    assert!(build_frame(1, MailboxType::VendorSpecific, &data, &mut window).is_err());
+fn parse_rejects_window_shorter_than_declared_body() {
+    // Header claims a 100-byte body but only 8 bytes of window are present.
+    let header = MailboxHeader {
+        length: 100,
+        priority: Priority::Lowest,
+        mailbox_type: MailboxType::Foe,
+        counter: 1,
+    };
+    let mut window = [0u8; 8];
+    header.pack_to_slice(&mut window[..6]).unwrap();
+
+    assert!(parse_frame(&window).is_err());
 }
 
 #[test]
-fn build_rejects_frame_larger_than_window() {
-    // Body fits MAILBOX_MAX_LEN but not the (smaller) runtime window.
-    let data = [0u8; 300];
-    let mut window = [0u8; 256];
-    assert!(build_frame(1, MailboxType::VendorSpecific, &data, &mut window).is_err());
+fn frame_pack_rejects_buffer_too_short_for_frame() {
+    let data = [0u8; 60];
+    let frame = MailboxFrame {
+        header: MailboxHeader {
+            length: data.len() as u16,
+            priority: Priority::Lowest,
+            mailbox_type: MailboxType::Foe,
+            counter: 1,
+        },
+        body: &data,
+    };
+
+    // Buffer smaller than header + body must fail rather than truncate.
+    let mut too_small = [0u8; 32];
+    assert!(frame.pack_to_slice(&mut too_small).is_err());
 }

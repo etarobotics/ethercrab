@@ -5,22 +5,24 @@
 //! header's `service` nibble into an 8-byte struct whose `length` is measured from the true
 //! 6-byte boundary. [`MailboxHeader`] below is the pure ETG.1000.4 mailbox header, so every byte
 //! after it is caller-owned payload.
+//!
+//! Both directions are zero-copy against the [`PduStorage`](crate::PduStorage) frame the caller
+//! already provisions: an outgoing [`MailboxFrame`] packs its header and body straight into the
+//! send frame, and an incoming [`MailboxMessage`] borrows the received frame rather than copying it
+//! out. The mailbox window is therefore bounded by `MAX_PDU_DATA`, not a compile-time constant here.
 
 use crate::{
     error::{Error, MailboxError},
     mailbox::{MailboxType, Priority},
+    pdu_loop::ReceivedPdu,
 };
 use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireSized, EtherCrabWireWrite};
-
-/// Largest mailbox frame (6-byte header + body) this channel supports, i.e. the largest mailbox SM
-/// window it can drive. Sized to the window provisioned in the SII. The usable body is this minus
-/// [`MailboxHeader::PACKED_LEN`].
-pub const MAILBOX_MAX_LEN: usize = 512;
 
 /// The 6-byte ETG.1000.4 mailbox header (ETG.1000.4 §5.6). Unlike
 /// [`crate::mailbox::MailboxHeader`] this carries no CoE `service` field — the payload following it
 /// belongs entirely to the mailbox protocol chosen by [`mailbox_type`](Self::mailbox_type).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ethercrab_wire::EtherCrabWireReadWrite)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[wire(bytes = 6)]
 pub struct MailboxHeader {
     /// Length in bytes of the mailbox data that follows this header.
@@ -33,8 +35,7 @@ pub struct MailboxHeader {
     // Byte 4: Channel (6 bits, unused → skipped) then Priority (2 bits).
     #[wire(pre_skip = 6, bits = 2)]
     pub priority: Priority,
-    /// Which mailbox protocol the body carries (this channel uses
-    /// [`MailboxType::VendorSpecific`]).
+    /// Which mailbox protocol the body carries.
     // Byte 5: Type (4 bits) + Counter (3 bits) + 1 reserved bit.
     #[wire(bits = 4)]
     pub mailbox_type: MailboxType,
@@ -43,15 +44,81 @@ pub struct MailboxHeader {
     pub counter: u8,
 }
 
-/// A mailbox message: the parsed [`MailboxHeader`] plus its raw body (already truncated to
-/// [`header.length`](MailboxHeader::length)).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MailboxMessage {
-    /// The 6-byte ETG.1000.4 header. `header.mailbox_type` and `header.counter` identify the
-    /// message; `header.length == body.len()`.
+/// An outgoing mailbox frame: a header plus a body, packed in place into the send buffer.
+///
+/// The body is any [`EtherCrabWireWrite`] — a raw `&[u8]`, or a typed protocol frame (e.g. an FoE
+/// frame) that itself packs a sub-header plus payload. Because everything packs directly into the
+/// send frame there is no intermediate scratch buffer. The send zero-pads the datagram out to the
+/// mailbox SM window (via `with_len`) so the ESC flips the SM full on the last byte.
+#[derive(Clone, Copy, Debug)]
+pub struct MailboxFrame<B> {
+    /// The 6-byte header. `header.length` must equal the body's packed length.
     pub header: MailboxHeader,
-    /// Raw mailbox data (the bytes after the header).
-    pub body: heapless::Vec<u8, MAILBOX_MAX_LEN>,
+    /// The mailbox body (bytes after the header).
+    pub body: B,
+}
+
+impl<B: EtherCrabWireWrite> EtherCrabWireWrite for MailboxFrame<B> {
+    fn pack_to_slice_unchecked<'buf>(&self, buf: &'buf mut [u8]) -> &'buf [u8] {
+        let header_len = MailboxHeader::PACKED_LEN;
+
+        self.header.pack_to_slice_unchecked(&mut buf[..header_len]);
+        let body_len = self.body.pack_to_slice_unchecked(&mut buf[header_len..]).len();
+
+        &buf[..header_len + body_len]
+    }
+
+    fn packed_len(&self) -> usize {
+        MailboxHeader::PACKED_LEN + self.body.packed_len()
+    }
+}
+
+/// A received mailbox message: the parsed [`MailboxHeader`] and a zero-copy view of its body.
+///
+/// Holds the [`ReceivedPdu`] the frame arrived in, so [`body`](Self::body) borrows the frame
+/// buffer directly. Consume it promptly: like any `ReceivedPdu`, the underlying [`PduStorage`] slot
+/// is released as soon as the frame is read, so holding a `MailboxMessage` across another bus
+/// operation risks the slot being reused underneath it.
+///
+/// [`PduStorage`]: crate::PduStorage
+pub struct MailboxMessage<'sto> {
+    header: MailboxHeader,
+    pdu: ReceivedPdu<'sto>,
+}
+
+impl<'sto> MailboxMessage<'sto> {
+    /// Parse a mailbox frame read out of a mailbox SM window, validating that the declared body
+    /// length fits within the received frame.
+    pub(crate) fn parse(pdu: ReceivedPdu<'sto>) -> Result<Self, Error> {
+        // Validate against the received bytes; discard the borrow, keep the (Copy) header.
+        let (header, _body) = parse_frame(&pdu)?;
+
+        Ok(Self { header, pdu })
+    }
+
+    /// The parsed 6-byte mailbox header.
+    pub fn header(&self) -> &MailboxHeader {
+        &self.header
+    }
+
+    /// The mailbox protocol this message carries.
+    pub fn mailbox_type(&self) -> MailboxType {
+        self.header.mailbox_type
+    }
+
+    /// The cyclic mailbox counter this message arrived with.
+    pub fn counter(&self) -> u8 {
+        self.header.counter
+    }
+
+    /// The mailbox body: the bytes after the header, trimmed to the header's declared length.
+    pub fn body(&self) -> &[u8] {
+        let start = MailboxHeader::PACKED_LEN;
+        let end = start + usize::from(self.header.length);
+
+        // Bounds were validated in `parse`.
+        &self.pdu[start..end]
+    }
 }
 
 // Buffer/window length errors reuse `MailboxError::TooLong`; the CoE-oriented address/sub_index
@@ -63,47 +130,17 @@ fn too_long() -> Error {
     })
 }
 
-/// Build `[header][data]` into `out`, returning the frame length. `out` is the mailbox SM window
-/// slice, so `out.len()` bounds the frame (writing past the window would corrupt adjacent DPRAM);
-/// only the header + data are written and the send zero-pads the datagram to the window.
-pub fn build_frame(
-    counter: u8,
-    mailbox_type: MailboxType,
-    data: &[u8],
-    out: &mut [u8],
-) -> Result<usize, Error> {
-    let total = MailboxHeader::PACKED_LEN + data.len();
-
-    if total > MAILBOX_MAX_LEN || out.len() < total {
-        return Err(too_long());
-    }
-
-    let header = MailboxHeader {
-        length: data.len() as u16,
-        priority: Priority::Lowest,
-        mailbox_type,
-        counter,
-    };
-
-    header.pack_to_slice(&mut out[..MailboxHeader::PACKED_LEN])?;
-    out[MailboxHeader::PACKED_LEN..total].copy_from_slice(data);
-
-    Ok(total)
-}
-
-/// Parse a frame read out of a mailbox window, truncating the body to the header's declared length.
-pub fn parse_frame(window: &[u8]) -> Result<MailboxMessage, Error> {
+/// Parse a mailbox `window`, returning the header and a borrowed body slice trimmed to the header's
+/// declared length. Trailing window padding past that length is not part of the message.
+pub fn parse_frame(window: &[u8]) -> Result<(MailboxHeader, &[u8]), Error> {
     let header = MailboxHeader::unpack_from_slice(
         window.get(..MailboxHeader::PACKED_LEN).ok_or_else(too_long)?,
     )?;
 
-    let len = usize::from(header.length);
     let start = MailboxHeader::PACKED_LEN;
+    let end = start + usize::from(header.length);
 
-    let body_bytes = window.get(start..start + len).ok_or_else(too_long)?;
+    let body = window.get(start..end).ok_or_else(too_long)?;
 
-    let mut body = heapless::Vec::new();
-    body.extend_from_slice(body_bytes).map_err(|_| too_long())?;
-
-    Ok(MailboxMessage { header, body })
+    Ok((header, body))
 }

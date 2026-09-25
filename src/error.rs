@@ -95,6 +95,9 @@ pub enum Error {
 
     /// A distributed clock error occurred.
     DistributedClock(DistributedClockError),
+
+    /// A File over EtherCAT (FoE) transfer failed.
+    Foe(FoeError),
 }
 
 #[cfg(feature = "std")]
@@ -154,6 +157,84 @@ impl core::fmt::Display for Error {
             Error::Wire(e) => write!(f, "wire encode/decode error: {}", e),
             Error::SubDevice(e) => write!(f, "subdevice error: {}", e),
             Error::DistributedClock(e) => write!(f, "distributed clock: {}", e),
+            Error::Foe(e) => write!(f, "foe: {}", e),
+        }
+    }
+}
+
+/// A File over EtherCAT (FoE) transfer error.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum FoeError {
+    /// The file name is too long to fit in the SubDevice's mailbox.
+    FileNameTooLong {
+        /// The file name length in bytes.
+        len: usize,
+        /// The largest file name the mailbox can carry.
+        capacity: usize,
+    },
+    /// The SubDevice refused the transfer with an FoE error packet.
+    Refused {
+        /// The FoE error code the SubDevice reported.
+        code: u32,
+    },
+    /// The SubDevice sent a data packet out of sequence.
+    PacketOutOfOrder {
+        /// The packet number expected next.
+        expected: u32,
+        /// The packet number received.
+        got: u32,
+    },
+    /// The SubDevice answered with an FoE opcode that has no place in this transfer.
+    UnexpectedOpcode(crate::foe::FoeOpcode),
+    /// A reply was too short to contain an FoE header.
+    Truncated {
+        /// The reply length in bytes.
+        len: usize,
+    },
+    /// The SubDevice reported itself busy for too many consecutive replies.
+    BusyTimeout {
+        /// The number of consecutive busy replies.
+        replies: u32,
+    },
+    /// The transfer exceeded the caller-supplied buffer.
+    DestTooSmall {
+        /// The caller's buffer length in bytes.
+        capacity: usize,
+    },
+}
+
+impl core::fmt::Display for FoeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FoeError::FileNameTooLong { len, capacity } => write!(
+                f,
+                "file name of {} bytes does not fit a {}-byte request",
+                len, capacity
+            ),
+            FoeError::Refused { code } => {
+                write!(f, "subdevice refused the transfer: error {:#010x}", code)
+            }
+            FoeError::PacketOutOfOrder { expected, got } => write!(
+                f,
+                "expected FoE data packet {}, subdevice sent {}",
+                expected, got
+            ),
+            FoeError::UnexpectedOpcode(opcode) => {
+                write!(f, "subdevice replied with unexpected FoE opcode {:?}", opcode)
+            }
+            FoeError::Truncated { len } => {
+                write!(f, "{}-byte reply is too short to be an FoE frame", len)
+            }
+            FoeError::BusyTimeout { replies } => {
+                write!(f, "subdevice reported busy {} times running", replies)
+            }
+            FoeError::DestTooSmall { capacity } => write!(
+                f,
+                "file is larger than the {}-byte destination buffer",
+                capacity
+            ),
         }
     }
 }
@@ -460,7 +541,7 @@ impl<T> IgnoreNoCategory<T> for Result<T, Error> {
         match self {
             Ok(result) => Ok(Some(result)),
             Err(Error::Eeprom(EepromError::NoCategory)) => Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
     }
 }
