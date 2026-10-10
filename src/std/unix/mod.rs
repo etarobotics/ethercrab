@@ -148,6 +148,72 @@ pub fn tx_rx_task<'sto>(
     Ok(task)
 }
 
+/// A busy-polling [`tx_rx_task`]: reads the socket directly and yields each pass
+/// instead of parking on the async-io reactor, whose park→wake costs tens of µs
+/// per receive. Needs an executor that re-polls it every pass.
+pub fn tx_rx_task_busy_poll<'sto>(
+    interface: &str,
+    mut pdu_tx: PduTx<'sto>,
+    #[allow(unused_mut)] mut pdu_rx: PduRx<'sto>,
+) -> Result<impl Future<Output = Result<(PduTx<'sto>, PduRx<'sto>), Error>> + 'sto, std::io::Error>
+{
+    #[allow(unused_mut)]
+    let mut socket = RawSocketDesc::new(interface)?;
+
+    #[cfg(target_os = "linux")]
+    socket.enable_busy_poll();
+
+    #[cfg(all(not(target_os = "linux"), unix))]
+    if let Some(mac) = socket.mac().ok().flatten() {
+        pdu_rx.set_source_mac(mac);
+    }
+
+    let mtu = socket.interface_mtu()?;
+
+    Ok(async move {
+        use std::io::{Read as _, Write as _};
+
+        let mut buf = vec![0; mtu];
+
+        loop {
+            if pdu_tx.should_exit() {
+                return Ok((pdu_tx.release(), pdu_rx.release()));
+            }
+
+            while let Some(frame) = pdu_tx.next_sendable_frame() {
+                frame.send_blocking(|data| match socket.write(data) {
+                    Ok(sent) if sent == data.len() => Ok(sent),
+                    Ok(sent) => Err(Error::PartialSend {
+                        len: data.len(),
+                        sent,
+                    }),
+                    Err(e) => {
+                        fmt::error!("Send PDU failed: {}", e);
+                        Err(Error::SendFrame)
+                    }
+                })?;
+            }
+
+            match socket.read(&mut buf) {
+                Ok(n) => {
+                    let packet = buf.get(0..n).ok_or(Error::Internal)?;
+                    if n == 0 {
+                        fmt::warn!("Received zero bytes");
+                    }
+                    if let Err(e) = pdu_rx.receive_frame(packet) {
+                        fmt::error!("Failed to receive frame: {}", e);
+                        return Err(Error::ReceiveFrame);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => fmt::error!("Receive PDU failed: {}", e),
+            }
+
+            futures_lite::future::yield_now().await;
+        }
+    })
+}
+
 /// Get the current time in nanoseconds from the EtherCAT epoch, 2000-01-01.
 ///
 /// On POSIX systems, this function uses the monotonic clock provided by the system.

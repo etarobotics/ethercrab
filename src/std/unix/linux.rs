@@ -47,6 +47,23 @@ impl RawSocketDesc {
         Ok(self_)
     }
 
+    /// Ask reads to NAPI-poll the driver directly instead of waiting for the RX
+    /// softirq. `SO_PREFER_BUSY_POLL` only holds NAPI in poll mode if the interface
+    /// also sets `napi_defer_hard_irqs` + `gro_flush_timeout`; best-effort otherwise.
+    pub(super) fn enable_busy_poll(&self) {
+        let set = |option: libc::c_int, value: libc::c_int| unsafe {
+            libc::setsockopt(
+                self.lower,
+                libc::SOL_SOCKET,
+                option,
+                addr_of!(value).cast(),
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        };
+        set(libc::SO_BUSY_POLL, 50);
+        set(libc::SO_PREFER_BUSY_POLL, 1);
+    }
+
     fn bind_interface(&mut self) -> io::Result<()> {
         let protocol = ETHERCAT_ETHERTYPE as i16;
 
